@@ -4,14 +4,23 @@ CARGO_OPT="--release"
 DOCKER_USER=`id -u`:`id -g`
 SANZU_VERSION:=$(shell grep "^version" ../sanzu/Cargo.toml  | head -1 | cut -d'"' -f2)
 
-debian:
-	docker build -t sanzu-builder:debian -f Dockerfile-debian .
+debian11:
+	docker build -t sanzu-builder:debian11 -f Dockerfile-debian11 .
 	docker run -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu" \
-		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
 	docker run -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu --variant=client" \
-		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
 	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu_broker" \
-		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
+
+debian12:
+	docker build -t sanzu-builder:debian12 -f Dockerfile-debian12 .
+	docker run -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu" \
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
+	docker run -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu --variant=client" \
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
+	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu_broker" \
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
 
 alpine:
 	docker build -t sanzu-builder:alpine -f Dockerfile-alpine .
@@ -50,7 +59,8 @@ clean:
 	rm -fr ../target/
 
 mrproper: clean
-	docker image rm sanzu-builder:debian
+	docker image rm sanzu-builder:debian11
+	docker image rm sanzu-builder:debian12
 	docker image rm sanzu-builder:alpine
 	docker image rm sanzu-builder:almalinux8
 	docker image rm sanzu-builder:almalinux9

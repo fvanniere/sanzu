@@ -32,7 +32,7 @@ jobs:
             ./target/release/sanzu_broker
 
 
-  docker-debian:
+  docker-debian11:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -41,12 +41,29 @@ jobs:
           toolchain: stable
           components: rustfmt
       - name: build
-        run: cargo clean && cd build && make debian
+        run: cargo clean && cd build && make debian11
 
-      - name: Upload resulting 'debian pkg'
+      - name: Upload resulting 'debian11 pkg'
         uses: actions/upload-artifact@v3
         with:
-          name: sanzu-debian-release
+          name: sanzu-debian11-release
+          path: ./target/debian/sanzu*.deb
+
+  docker-debian12:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: build
+        run: cargo clean && cd build && make debian12
+
+      - name: Upload resulting 'debian12 pkg'
+        uses: actions/upload-artifact@v3
+        with:
+          name: sanzu-debian12-release
           path: ./target/debian/sanzu*.deb
 
   docker-alma8:
@@ -103,7 +120,7 @@ jobs:
   release:
     # From https://github.com/cloudflare/wrangler/blob/master/.github/workflows/release.yml
     name: GitHub Release
-    needs: [docker-alpine, docker-alma8, docker-alma9, docker-debian, docker-windows]
+    needs: [docker-alpine, docker-alma8, docker-alma9, docker-debian11, docker-debian-12, docker-windows]
     runs-on: ubuntu-latest
     steps:
       - name: Query version number
@@ -135,10 +152,15 @@ jobs:
         with:
           name: sanzu-alpine-release
 
-      - name: Download Debian artifact
+      - name: Download Debian 11 artifact
         uses: actions/download-artifact@v1
         with:
-          name: sanzu-debian-release
+          name: sanzu-debian11-release
+    
+      - name: Download Debian 12 artifact
+        uses: actions/download-artifact@v1
+        with:
+          name: sanzu-debian12-release
 
       - name: Download Alma8 artifact
         uses: actions/download-artifact@v1
@@ -160,10 +182,15 @@ jobs:
         run: |
           zip -r sanzu-alpine.zip sanzu-alpine-release
 
-      - name: compression_debian
+      - name: compression_debian11
         shell: bash
         run: |
-          zip -r sanzu-debian.zip sanzu-debian-release
+          zip -r sanzu-debian11_amd64.zip sanzu-debian11-release
+
+      - name: compression_debian12
+        shell: bash
+        run: |
+          zip -r sanzu-debian12_amd64.zip sanzu-debian12-release
 
       - name: compression_alma8
         shell: bash
@@ -190,15 +217,25 @@ jobs:
           asset_content_type: application/octet-stream
           asset_name: sanzu-alpine-${{ steps.get_version.outputs.VERSION }}.zip
 
-      - name: Release Debian artifact
+      - name: Release Debian 11 artifact
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./sanzu-debian.zip
+          asset_path: ./sanzu-debian11_amd64.zip
           asset_content_type: application/octet-stream
-          asset_name: sanzu-debian-${{ steps.get_version.outputs.VERSION }}.zip
+          asset_name: sanzu-debian11-${{ steps.get_version.outputs.VERSION }}_amd64.zip
+
+      - name: Release Debian 12 artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./sanzu-debian12_amd64.zip
+          asset_content_type: application/octet-stream
+          asset_name: sanzu-debian12-${{ steps.get_version.outputs.VERSION }}_amd64.zip
 
       - name: Release Alma8 artifact
         uses: actions/upload-release-asset@v1
