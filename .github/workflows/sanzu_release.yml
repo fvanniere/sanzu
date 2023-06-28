@@ -82,7 +82,7 @@ jobs:
           arch: aarch64
           distro: ubuntu_latest
           githubToken: ${{ github.token }}
-          run: cargo clean && cd build && make debian12
+          run: cd build && make debian12
       - name: Upload resulting 'debian12 arm64 pkg'
         uses: actions/upload-artifact@v3
         with:
