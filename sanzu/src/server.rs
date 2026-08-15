@@ -33,6 +33,7 @@ use vsock;
 use crate::config::AuthType;
 use crate::{
     config::{ConfigServer, ConfigTls},
+    fido::FidoServer,
     sound::SoundEncoder,
     utils::{HasTimeout, ServerArgsConfig, ServerEvent},
     video_encoder::{get_encoder_category, init_video_encoder, Encoder},
@@ -123,6 +124,11 @@ pub fn run(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result<()> {
 /// - receive / handle client events
 pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result<()> {
     info!("Start server");
+    if arguments.fido && !cfg!(target_os = "linux") {
+        return Err(anyhow!(
+            "FIDO forwarding requires a Linux server with /dev/uhid"
+        ));
+    }
     let connection_timeout = arguments
         .connection_timeout
         .map(|timeout| std::time::Duration::from_secs(timeout as u64));
@@ -275,7 +281,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
     let codec_name = get_encoder_category(&arguments.encoder)?;
 
     /* Send server hello with image info & codec name */
-    let (mut server_info, audio_sample_rate) =
+    let (mut server_info, audio_sample_rate, fido_info) =
         if arguments.keep_server_resolution || arguments.rdonly {
             #[cfg(unix)]
             let server_info = init_x11rb(arguments, config, None).context("Cannot init_x11rb")?;
@@ -291,6 +297,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
             let server_hello = tunnel::ServerHello {
                 codec_name,
                 audio: arguments.audio,
+                fido: arguments.fido,
                 msg: Some(server_mode),
             };
 
@@ -305,7 +312,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
                 true => Some(msg.audio_sample_rate),
                 false => None,
             };
-            (server_info, audio_sample_rate)
+            (server_info, audio_sample_rate, msg.fido)
         } else {
             let server_mode = tunnel::server_hello::Msg::AdaptScreen(tunnel::ServerAdaptScreen {
                 seamless: arguments.seamless,
@@ -314,6 +321,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
             let server_hello = tunnel::ServerHello {
                 codec_name,
                 audio: arguments.audio,
+                fido: arguments.fido,
                 msg: Some(server_mode),
             };
 
@@ -346,8 +354,20 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
                 true => Some(msg.audio_sample_rate),
                 false => None,
             };
-            (server_info, audio_sample_rate)
+            (server_info, audio_sample_rate, msg.fido)
         };
+
+    let mut fido = match fido_info {
+        Some(info) if arguments.fido => {
+            Some(FidoServer::create(&info).map_err(|err| send_server_err_event(&mut sock, err))?)
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "Client requested FIDO forwarding but the server does not allow it"
+            ))
+        }
+        None => None,
+    };
 
     let mut video_encoder: Box<dyn Encoder> = init_video_encoder(
         arguments.encoder.as_str(),
@@ -514,14 +534,35 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
         let msg = tunnel::MessageSrv { msg: Some(msg) };
         events.push(msg);
 
+        let fido_reports = match fido.as_mut() {
+            Some(fido) => fido
+                .poll_reports()
+                .context("Cannot poll virtual FIDO authenticator")?,
+            None => Vec::new(),
+        };
+
         /* Send events */
-        send_server_msg_type!(&mut sock, tunnel::MessagesSrv { msgs: events }, Msgssrv)
-            .context("Cannot send events")?;
+        send_server_msg_type!(
+            &mut sock,
+            tunnel::MessagesSrv {
+                msgs: events,
+                fido_reports,
+            },
+            Msgssrv
+        )
+        .context("Cannot send events")?;
 
         let time_send = Instant::now();
 
-        let msgs =
+        let mut msgs =
             recv_client_msg_type!(&mut sock, Msgsclient).context("Cannot recv client msgs")?;
+
+        if let Some(ref mut fido) = fido {
+            fido.write_reports(std::mem::take(&mut msgs.fido_reports))
+                .context("Cannot forward reports to virtual FIDO authenticator")?;
+        } else if !msgs.fido_reports.is_empty() {
+            return Err(anyhow!("Client sent FIDO reports without negotiation"));
+        }
 
         if !arguments.rdonly {
             let server_events = server_info

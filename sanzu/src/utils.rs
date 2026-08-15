@@ -119,6 +119,12 @@ pub struct ServerArgsConfig {
     pub audio: bool,
     #[clap(
         long,
+        default_value_t = false,
+        help = "Allow a client FIDO authenticator to be exposed as a virtual UHID device (Linux only)"
+    )]
+    pub fido: bool,
+    #[clap(
+        long,
         short = 'r',
         default_value_t = false,
         help = "Transmit Raw sound (not encoded)"
@@ -222,6 +228,17 @@ pub struct ClientArgsConfig {
         help = "Allow audio forwarding from server to client"
     )]
     pub audio: bool,
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "Forward a local FIDO/CTAP HID authenticator without USB passthrough"
+    )]
+    pub fido: bool,
+    #[clap(
+        long,
+        help = "FIDO HID device path to forward (for example /dev/hidraw4); also enables --fido"
+    )]
+    pub fido_device: Option<String>,
     #[clap(long, short = 's', help = "Audio sample rate")]
     pub audio_sample_rate: Option<u32>,
     #[clap(

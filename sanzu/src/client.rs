@@ -25,6 +25,7 @@ use crate::{
     client_graphics::*,
     client_utils::Area,
     config::ConfigClient,
+    fido::FidoClient,
     osd::{draw_text, TestDisplay},
     //proto::{Tunnel, ReadWrite},
     sound::SoundDecoder,
@@ -479,6 +480,7 @@ pub fn do_run(
     let msg = recv_server_msg_type!(server, Hello).context("Error in recv ServerHello")?;
 
     info!("{:?}", msg);
+    let server_allows_fido = msg.fido;
     let codec_name = match &arguments.decoder {
         Some(decoder_name) => decoder_name.to_owned(),
         None => msg.codec_name.to_owned(),
@@ -499,6 +501,22 @@ pub fn do_run(
         ));
     }
 
+    let fido_requested = arguments.fido || arguments.fido_device.is_some();
+    if fido_requested && !server_allows_fido {
+        return Err(anyhow!(
+            "FIDO forwarding requested but the server was not started with --fido"
+        ));
+    }
+    let fido = if fido_requested {
+        Some(
+            FidoClient::open(arguments.fido_device.as_deref())
+                .map_err(|err| send_client_err_event(server, err))?,
+        )
+    } else {
+        None
+    };
+    let fido_info = fido.as_ref().map(FidoClient::info);
+
     #[cfg(unix)]
     let mut client = init_x11rb(arguments, seamless, server_size)
         .context("Error in init_x11rb")
@@ -514,6 +532,7 @@ pub fn do_run(
             let client_hello = tunnel::ClientHelloFullscreen {
                 audio,
                 audio_sample_rate,
+                fido: fido_info.clone(),
             };
             send_client_msg_type!(server, client_hello, Clienthellofullscreen)
                 .context("Error in send ClientHelloFullscreen")?;
@@ -528,6 +547,7 @@ pub fn do_run(
                 audio_sample_rate,
                 width: width_even,
                 height: height_event,
+                fido: fido_info.clone(),
             };
             send_client_msg_type!(server, client_hello, Clienthelloresolution)
                 .context("Error in send ClientHelloResolution")?;
@@ -555,6 +575,11 @@ pub fn do_run(
 
         let display_size = client.size();
         let mut msgs = client.poll_events().context("Error in poll_events")?;
+        if let Some(ref fido) = fido {
+            msgs.fido_reports = fido
+                .poll_reports()
+                .context("Cannot poll forwarded FIDO authenticator")?;
+        }
         scale_client_events(
             &mut msgs,
             display_size,
@@ -575,6 +600,13 @@ pub fn do_run(
         let time_recv = Instant::now();
 
         let mut img_todo = None;
+
+        if let Some(ref fido) = fido {
+            fido.write_reports(msg.fido_reports)
+                .context("Cannot forward reports to the local FIDO authenticator")?;
+        } else if !msg.fido_reports.is_empty() {
+            return Err(anyhow!("Server sent FIDO reports without negotiation"));
+        }
 
         for msg in msg.msgs {
             match msg.msg {

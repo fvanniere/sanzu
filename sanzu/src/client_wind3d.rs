@@ -1739,7 +1739,10 @@ impl Client for ClientWindows {
             }
         }
 
-        Ok(tunnel::MessagesClient { msgs: events })
+        Ok(tunnel::MessagesClient {
+            msgs: events,
+            fido_reports: Vec::new(),
+        })
     }
 
     fn display_stats(&self) -> bool {

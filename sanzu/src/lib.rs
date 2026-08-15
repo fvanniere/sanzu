@@ -18,6 +18,7 @@ pub mod client_wind3d;
 #[cfg(unix)]
 pub mod client_x11;
 pub mod ffmpeg_helper;
+pub mod fido;
 pub mod server_utils;
 #[cfg(unix)]
 pub use x11_clipboard;

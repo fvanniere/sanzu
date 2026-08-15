@@ -297,6 +297,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ProxyArgsConfig) -> Result<
     let server_hello = tunnel::ServerHello {
         codec_name,
         audio: arguments.audio,
+        fido: msg.fido,
         msg: msg.msg,
     };
 
@@ -386,6 +387,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ProxyArgsConfig) -> Result<
         let mut time_encode_sound: Option<String> = None;
 
         let mut events = vec![];
+        let fido_reports = msgs.fido_reports;
         for msg in msgs.msgs {
             match msg.msg {
                 /* Disallow encoded image form server to client*/
@@ -510,7 +512,10 @@ pub fn run_server(config: &ConfigServer, arguments: &ProxyArgsConfig) -> Result<
             }
         }
 
-        let msgs = tunnel::MessagesSrv { msgs: events };
+        let msgs = tunnel::MessagesSrv {
+            msgs: events,
+            fido_reports,
+        };
         send_srv_msg_type!(&mut client, msgs, Msgssrv)
             .context("Error in send MessagesSrv")
             .map_err(|err| send_client_err_event(&mut server, err))?;
@@ -520,6 +525,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ProxyArgsConfig) -> Result<
             .context("Error in recv MessagesClient")
             .map_err(|err| send_client_err_event(&mut server, err))?;
 
+        let fido_reports = msgs.fido_reports;
         let mut events = vec![];
         for msg in msgs.msgs {
             match msg.msg {
@@ -535,7 +541,10 @@ pub fn run_server(config: &ConfigServer, arguments: &ProxyArgsConfig) -> Result<
                 _ => {}
             }
         }
-        let msgs = tunnel::MessagesClient { msgs: events };
+        let msgs = tunnel::MessagesClient {
+            msgs: events,
+            fido_reports,
+        };
 
         send_client_msg_type!(&mut server, msgs, Msgsclient)
             .context("Error in send MessagesClient")

@@ -7,11 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-15
+
+### Added
+- Opt-in FIDO/CTAP HID forwarding from a Linux or Windows client to a Linux
+  server, allowing remote Firefox passkey operations without USB passthrough.
+- Automatic FIDO authenticator discovery and explicit selection with
+  `--fido-device`.
+
+### Security
+- FIDO forwarding must be enabled explicitly with `--fido` on both endpoints.
+- The client opens only the FIDO HID interface and never detaches or claims the
+  complete USB device, preserving local Firefox and CCID-based GPG/PIV use.
+
 ## [0.2.0] - 2026-08-15
 
 ### Added
 - Client-side zoom to encode a smaller adaptive remote desktop and upscale it locally.
-- GitLab CI/CD packaging for Debian 13 (Trixie), with tagged releases published to the generic package registry.
+- GitLab CI/CD packaging for Debian 13 (Trixie), with tagged and `main` builds published to the generic package registry.
 
 ### Changed
 - Update FFmpeg bindings to 7.1 for Debian Trixie compatibility.

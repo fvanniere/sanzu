@@ -19,6 +19,7 @@ You can find more information on the architecture in `doc/architecture.md`.
 - PAM
 - One way clipboard
 - Seamless mode
+- Shared FIDO2/passkey forwarding
 
 ## Options
 ```
@@ -68,6 +69,40 @@ client display:
 Mouse coordinates, resized windows, and seamless areas are scaled automatically. Zoom requires
 the server's adaptive-resolution mode (the default); it is incompatible with
 `--keep-server-resolution`.
+
+### FIDO2 / YubiKey forwarding
+
+A Linux or Windows client can expose the FIDO interface of a local YubiKey (or
+another CTAP HID authenticator) to Firefox on a Linux server. This is a CTAPHID
+report proxy, not USB passthrough: Sanzu does not detach a driver or claim the
+whole USB device. The YubiKey's CCID interface remains available to local GPG
+and PIV applications. On Linux, the kernel also delivers hidraw input reports
+to every open reader, while CTAPHID gives each application its own logical
+channel, so local and remote Firefox can both keep using the key.
+
+Enable the feature explicitly on both sides:
+
+```
+# Server (Linux): the process must have read/write access to /dev/uhid
+DISPLAY=:100 sanzu_server --config sanzu.toml --fido
+
+# Client: automatically choose the first FIDO HID authenticator
+sanzu_client 192.168.0.1 1122 --fido
+
+# Or select one explicitly on Linux
+sanzu_client 192.168.0.1 1122 --fido-device /dev/hidraw4
+```
+
+The client needs access to the physical HID device, and the server needs access
+to `/dev/uhid`. Configure narrow udev permissions for the accounts running
+Sanzu; running either endpoint as root is not required. Multiple CTAPHID
+applications may share the key, although the authenticator can serialize two
+operations that require a touch or PIN.
+
+FIDO commands travel inside the existing Sanzu connection. Use TLS or an SSH
+`--proxycommand` on an untrusted network. Enabling this option authorizes the
+remote session to ask the key for assertions; normal authenticator user-presence
+and PIN/UV checks still apply.
 
 ## Replacement of ssh -Y
 If you have a server, let's say Rochefort, which runs a X server on the display :1234, you can access it with:

@@ -1,6 +1,6 @@
 [package]
 name = "sanzu"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 readme = "README.md"
@@ -59,6 +59,7 @@ default = ["kerberos"]
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "4.5"
 ico = "0.3"
+hidapi = { version = "2.6.6", default-features = false, features = ["windows-native"] }
 winapi = { version = "0.3", features = [
   "impl-default", "winuser", "wingdi", "winbase", "libloaderapi", "processthreadsapi",
   "errhandlingapi", "winerror", "commctrl", "sysinfoapi", "shobjidl", "combaseapi",
@@ -70,6 +71,10 @@ libgssapi = { version = "0.6", optional = true }
 nix = "0.26"
 vsock = "0.3"
 x11-clipboard = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+hidapi = { version = "2.6.6", default-features = false, features = ["linux-native-basic-udev"] }
+uhid-virt = "0.0.8"
 
 [dependencies.x11rb]
 version = "0.12"
