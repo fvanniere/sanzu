@@ -106,6 +106,12 @@ If a text or `VID:PID` selector matches several authenticators, Sanzu lists the
 candidates and asks for a more precise selector instead of choosing one
 silently. A serial substring or the HID path can distinguish identical keys.
 
+Unplugging the forwarded authenticator suspends only FIDO forwarding; the video
+session remains open. The client retries once per second and resumes forwarding
+after the same vendor, product and product name are available again. Prefer a
+text or `VID:PID` selector when hot-unplug is expected because a Linux
+`/dev/hidrawN` path can change after reconnection.
+
 The client needs access to the physical HID device, and the server needs access
 to `/dev/uhid`. Configure narrow udev permissions for the accounts running
 Sanzu; running either endpoint as root is not required. Multiple CTAPHID

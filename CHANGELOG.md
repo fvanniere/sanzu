@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-15
+
+### Fixed
+- Keep the client video session alive when a forwarded FIDO authenticator is
+  unplugged, then retry it every second and resume forwarding when the same
+  device is reconnected.
+- Drop remote FIDO reports safely while the local authenticator is absent.
+
 ## [0.2.3] - 2026-08-15
 
 ### Added

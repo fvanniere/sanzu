@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 extern crate libc;
 use memmap2::MmapOptions;
-use std::{collections::HashMap, fmt::Write as _, net::TcpStream, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    net::TcpStream,
+    time::{Duration, Instant},
+};
 
 use std::{
     convert::TryInto,
@@ -103,6 +108,14 @@ fn zoomed_dimension(dimension: u32, zoom: f64) -> u32 {
     // Video encoders generally require even dimensions. Keep a non-zero minimum
     // for very small client windows.
     (((dimension as f64 / zoom).round() as u32).max(2)) & !1
+}
+
+const FIDO_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+fn same_fido_device(left: &tunnel::FidoDevice, right: &tunnel::FidoDevice) -> bool {
+    left.vendor_id == right.vendor_id
+        && left.product_id == right.product_id
+        && left.product_name == right.product_name
 }
 
 fn scale_coordinate(value: u32, from: u32, to: u32) -> u32 {
@@ -507,7 +520,7 @@ pub fn do_run(
             "FIDO forwarding requested but the server was not started with --fido"
         ));
     }
-    let fido = if fido_requested {
+    let mut fido = if fido_requested {
         Some(
             FidoClient::open(arguments.fido_device.as_deref())
                 .map_err(|err| send_client_err_event(server, err))?,
@@ -516,6 +529,7 @@ pub fn do_run(
         None
     };
     let fido_info = fido.as_ref().map(FidoClient::info);
+    let mut fido_retry_at = None;
 
     #[cfg(unix)]
     let mut client = init_x11rb(arguments, seamless, server_size)
@@ -573,12 +587,50 @@ pub fn do_run(
         let mut areas = HashMap::new();
         let time_start = Instant::now();
 
+        if fido.is_none()
+            && fido_requested
+            && fido_retry_at.map_or(true, |retry_at| retry_at <= time_start)
+        {
+            match FidoClient::open(arguments.fido_device.as_deref()) {
+                Ok(candidate)
+                    if fido_info
+                        .as_ref()
+                        .is_some_and(|expected| same_fido_device(&candidate.info(), expected)) =>
+                {
+                    info!("Local FIDO authenticator reconnected; forwarding resumed");
+                    fido = Some(candidate);
+                    fido_retry_at = None;
+                }
+                Ok(candidate) => {
+                    let candidate_info = candidate.info();
+                    warn!(
+                        "Ignoring a different FIDO authenticator {:?} ({:04x}:{:04x}) while waiting for the original device",
+                        candidate_info.product_name,
+                        candidate_info.vendor_id,
+                        candidate_info.product_id
+                    );
+                    fido_retry_at = Some(time_start + FIDO_REOPEN_INTERVAL);
+                }
+                Err(err) => {
+                    debug!("Local FIDO authenticator is still unavailable: {err:#}");
+                    fido_retry_at = Some(time_start + FIDO_REOPEN_INTERVAL);
+                }
+            }
+        }
+
         let display_size = client.size();
         let mut msgs = client.poll_events().context("Error in poll_events")?;
-        if let Some(ref fido) = fido {
-            msgs.fido_reports = fido
-                .poll_reports()
-                .context("Cannot poll forwarded FIDO authenticator")?;
+        if let Some(fido_result) = fido.as_ref().map(FidoClient::poll_reports) {
+            match fido_result {
+                Ok(reports) => msgs.fido_reports = reports,
+                Err(err) => {
+                    warn!(
+                        "Local FIDO authenticator disconnected while reading ({err:#}); suspending FIDO forwarding without closing the video session"
+                    );
+                    fido = None;
+                    fido_retry_at = Some(time_start + FIDO_REOPEN_INTERVAL);
+                }
+            }
         }
         scale_client_events(
             &mut msgs,
@@ -601,11 +653,23 @@ pub fn do_run(
 
         let mut img_todo = None;
 
-        if let Some(ref fido) = fido {
-            fido.write_reports(msg.fido_reports)
-                .context("Cannot forward reports to the local FIDO authenticator")?;
+        if let Some(ref current_fido) = fido {
+            if let Err(err) = current_fido.write_reports(msg.fido_reports) {
+                warn!(
+                    "Local FIDO authenticator disconnected while writing ({err:#}); suspending FIDO forwarding without closing the video session"
+                );
+                fido = None;
+                fido_retry_at = Some(Instant::now() + FIDO_REOPEN_INTERVAL);
+            }
         } else if !msg.fido_reports.is_empty() {
-            return Err(anyhow!("Server sent FIDO reports without negotiation"));
+            if fido_requested {
+                debug!(
+                    "Dropping {} remote FIDO report(s) while the local authenticator is unavailable",
+                    msg.fido_reports.len()
+                );
+            } else {
+                return Err(anyhow!("Server sent FIDO reports without negotiation"));
+            }
         }
 
         for msg in msg.msgs {
@@ -843,5 +907,19 @@ mod zoom_tests {
     fn pointer_coordinates_are_mapped_back_to_remote_space() {
         assert_eq!(scale_coordinate(1920, 3840, 1920), 960);
         assert_eq!(scale_coordinate(3839, 3840, 1920), 1919);
+    }
+
+    #[test]
+    fn fido_reconnect_requires_the_same_device_identity() {
+        let yubikey = tunnel::FidoDevice {
+            vendor_id: 0x1050,
+            product_id: 0x0407,
+            product_name: "YubiKey OTP+FIDO+CCID".to_owned(),
+        };
+        assert!(same_fido_device(&yubikey, &yubikey));
+
+        let mut other = yubikey.clone();
+        other.product_id = 0x0406;
+        assert!(!same_fido_device(&yubikey, &other));
     }
 }
