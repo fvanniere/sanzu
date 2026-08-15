@@ -57,7 +57,7 @@ publish:debian:trixie:
     - job: package:debian:trixie
       artifacts: true
   script:
-    - PACKAGE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' sanzu/Cargo.toml | head -n 1)"
+    - PACKAGE_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' sanzu/Cargo.toml)"
     - test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
     - |
       for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do
