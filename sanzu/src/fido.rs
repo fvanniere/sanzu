@@ -16,6 +16,7 @@ use serde_cbor::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    convert::TryInto,
     io::{Read, Write},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -329,7 +330,7 @@ impl FidoClient {
         let physical_token = self.obtain_physical_pin_token(cid)?;
         let mut proxy_token = Zeroizing::new(vec![0u8; 32]);
         OsRng.fill_bytes(&mut proxy_token);
-        let encrypted = aes_cbc_encrypt(&remote_secret, &proxy_token)?;
+        let encrypted = aes_cbc_encrypt(&remote_secret[..], &proxy_token)?;
         self.pin_session = Some(PinSession {
             proxy_token,
             physical_token,
@@ -353,7 +354,7 @@ impl FidoClient {
             let secret = shared_secret(&physical_secret, &authenticator_key);
 
             let digest = Sha256::digest(pin.as_bytes());
-            let pin_hash_enc = aes_cbc_encrypt(&secret, &digest[..16])?;
+            let pin_hash_enc = aes_cbc_encrypt(&secret[..], &digest[..16])?;
             let token_request = encode_client_pin(map_of([
                 (1, Value::Integer(1)),
                 (2, Value::Integer(5)),
@@ -366,7 +367,7 @@ impl FidoClient {
             }
             let token_map = successful_map(&token_response, "physical PIN token")?;
             let encrypted = map_bytes(&token_map, 2)?;
-            return Ok(Zeroizing::new(aes_cbc_decrypt(&secret, encrypted)?));
+            return Ok(Zeroizing::new(aes_cbc_decrypt(&secret[..], encrypted)?));
         }
         Err(anyhow!("The authenticator rejected the PIN"))
     }
@@ -624,8 +625,8 @@ fn decode_map(bytes: &[u8]) -> Result<BTreeMap<Value, Value>> {
 
 fn map_of<const N: usize>(entries: [(i128, Value); N]) -> BTreeMap<Value, Value> {
     entries
-        .into_iter()
-        .map(|(key, value)| (Value::Integer(key), value))
+        .iter()
+        .map(|(key, value)| (Value::Integer(*key), value.clone()))
         .collect()
 }
 
@@ -636,9 +637,8 @@ fn map_value(map: &BTreeMap<Value, Value>, key: i128) -> Result<&Value> {
 
 fn map_u8(map: &BTreeMap<Value, Value>, key: i128) -> Result<u8> {
     match map_value(map, key)? {
-        Value::Integer(value) => (*value)
-            .try_into()
-            .map_err(|_| anyhow!("CBOR map key {key} is not an unsigned byte")),
+        Value::Integer(value) if (0..=u8::MAX as i128).contains(value) => Ok(*value as u8),
+        Value::Integer(_) => Err(anyhow!("CBOR map key {key} is not an unsigned byte")),
         _ => Err(anyhow!("CBOR map key {key} is not an integer")),
     }
 }
