@@ -411,6 +411,10 @@ impl FidoClient {
         map.insert(Value::Integer(auth_key), Value::Bytes(translated));
         payload.truncate(1);
         payload.extend(serde_cbor::to_vec(&Value::Map(map))?);
+        // CTAP clears mc/ga permissions after an operation that tests user
+        // presence. Mirror that behavior in the proxy and erase both tokens
+        // before the physical authenticator is touched.
+        self.pin_session = None;
         Ok(())
     }
 

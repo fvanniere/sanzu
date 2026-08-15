@@ -118,6 +118,15 @@ Sanzu; running either endpoint as root is not required. Multiple CTAPHID
 applications may share the key, although the authenticator can serialize two
 operations that require a touch or PIN.
 
+When a PIN is required, a Linux client opens `pinentry-gnome3` (falling back to
+`pinentry`) on the local desktop. The plaintext PIN and the authenticator's real
+PIN/UV token stay on the client. Remote Firefox receives a random one-operation
+proxy token restricted to the requested relying party and make-credential or
+get-assertion permission; the client verifies and translates its proof locally.
+Unsupported ClientPIN management commands are rejected. PIN-protected remote
+operations currently fail closed on Windows clients until an equivalent native
+secure prompt is implemented.
+
 On a multi-user server, pass a distinct `--fido-virtual-id` to each server
 process. The resulting sysfs `phys` value is `sanzu/fido/<ID>`, so a udev rule
 can assign the matching `hidraw` node to that session only. Identifiers are
