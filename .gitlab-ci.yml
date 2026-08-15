@@ -58,14 +58,23 @@ publish:debian:trixie:
       artifacts: true
   script:
     - PACKAGE_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' sanzu/Cargo.toml)"
-    - test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
+        REGISTRY_VERSION="${PACKAGE_VERSION}"
+      else
+        test "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}"
+        REGISTRY_VERSION="${PACKAGE_VERSION}-${CI_COMMIT_SHORT_SHA}"
+      fi
+      export REGISTRY_VERSION
     - |
       for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do
         filename="$(basename "${package}")"
         curl --fail-with-body --location \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
           --upload-file "${package}" \
-          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${GENERIC_PACKAGE_NAME}/${PACKAGE_VERSION}/${filename}"
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${GENERIC_PACKAGE_NAME}/${REGISTRY_VERSION}/${filename}"
       done
   rules:
     - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
