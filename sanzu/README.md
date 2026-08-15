@@ -86,6 +86,9 @@ Enable the feature explicitly on both sides:
 # Server (Linux): the process must have read/write access to /dev/uhid
 DISPLAY=:100 sanzu_server --config sanzu.toml --fido
 
+# Multi-user server: give udev a stable, validated per-session phys identifier
+DISPLAY=:100 sanzu_server --config sanzu.toml --fido --fido-virtual-id fred
+
 # Client: automatically choose the first FIDO HID authenticator
 sanzu_client 192.168.0.1 1122 --fido
 
@@ -108,6 +111,12 @@ to `/dev/uhid`. Configure narrow udev permissions for the accounts running
 Sanzu; running either endpoint as root is not required. Multiple CTAPHID
 applications may share the key, although the authenticator can serialize two
 operations that require a touch or PIN.
+
+On a multi-user server, pass a distinct `--fido-virtual-id` to each server
+process. The resulting sysfs `phys` value is `sanzu/fido/<ID>`, so a udev rule
+can assign the matching `hidraw` node to that session only. Identifiers are
+limited to 1–64 ASCII letters, digits, `_` or `-`. Without the option, the
+backward-compatible `sanzu/fido0` path is used.
 
 FIDO commands travel inside the existing Sanzu connection. Use TLS or an SSH
 `--proxycommand` on an untrusted network. Enabling this option authorizes the

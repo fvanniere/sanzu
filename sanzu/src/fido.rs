@@ -249,7 +249,7 @@ pub struct FidoServer {
 pub struct FidoServer;
 
 impl FidoServer {
-    pub fn create(info: &tunnel::FidoDevice) -> Result<Self> {
+    pub fn create(info: &tunnel::FidoDevice, virtual_id: Option<&str>) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use uhid_virt::{Bus, CreateParams, UHIDDevice};
@@ -257,10 +257,11 @@ impl FidoServer {
             if info.vendor_id > u16::MAX as u32 || info.product_id > u16::MAX as u32 {
                 return Err(anyhow!("Invalid FIDO USB vendor/product identifier"));
             }
+            let phys = virtual_fido_phys(virtual_id)?;
             let product_name: String = info.product_name.chars().take(80).collect();
             let device = UHIDDevice::create(CreateParams {
                 name: format!("Sanzu forwarded {product_name}"),
-                phys: "sanzu/fido0".to_owned(),
+                phys: phys.clone(),
                 uniq: String::new(),
                 bus: Bus::USB,
                 vendor: info.vendor_id,
@@ -271,15 +272,15 @@ impl FidoServer {
             })
             .context("Cannot create /dev/uhid FIDO device")?;
             info!(
-                "Created virtual FIDO authenticator {:?} ({:04x}:{:04x})",
-                product_name, info.vendor_id, info.product_id
+                "Created virtual FIDO authenticator {:?} ({:04x}:{:04x}) at {}",
+                product_name, info.vendor_id, info.product_id, phys
             );
             return Ok(Self { device });
         }
 
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = info;
+            let _ = (info, virtual_id);
             Err(anyhow!(
                 "Virtual FIDO forwarding requires a Linux server with UHID"
             ))
@@ -352,6 +353,23 @@ impl FidoServer {
     }
 }
 
+fn virtual_fido_phys(virtual_id: Option<&str>) -> Result<String> {
+    let Some(virtual_id) = virtual_id else {
+        return Ok("sanzu/fido0".to_owned());
+    };
+    if virtual_id.is_empty()
+        || virtual_id.len() > 64
+        || !virtual_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "Invalid FIDO virtual identifier: expected 1 to 64 ASCII letters, digits, '_' or '-'"
+        ));
+    }
+    Ok(format!("sanzu/fido/{virtual_id}"))
+}
+
 fn validate_report(report: &[u8]) -> Result<()> {
     if report.len() != FIDO_REPORT_SIZE {
         Err(anyhow!(
@@ -372,6 +390,19 @@ mod tests {
         assert!(validate_report(&[0; FIDO_REPORT_SIZE]).is_ok());
         assert!(validate_report(&[0; FIDO_REPORT_SIZE - 1]).is_err());
         assert!(validate_report(&[0; FIDO_REPORT_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn builds_isolated_virtual_fido_paths() {
+        assert_eq!(virtual_fido_phys(None).unwrap(), "sanzu/fido0");
+        assert_eq!(
+            virtual_fido_phys(Some("fred-1")).unwrap(),
+            "sanzu/fido/fred-1"
+        );
+        assert!(virtual_fido_phys(Some("")).is_err());
+        assert!(virtual_fido_phys(Some("../fred")).is_err());
+        assert!(virtual_fido_phys(Some("fréd")).is_err());
+        assert!(virtual_fido_phys(Some(&"a".repeat(65))).is_err());
     }
 
     #[test]

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-15
+
+### Added
+- Add `--fido-virtual-id` on the server so multi-user deployments can assign
+  each forwarded `hidraw` device to its owning session through udev.
+
+### Security
+- Validate virtual FIDO identifiers and expose them through distinct sysfs
+  `phys` paths, preventing shared udev permissions between remote users.
+
 ## [0.2.2] - 2026-08-15
 
 ### Added

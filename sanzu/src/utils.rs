@@ -125,6 +125,12 @@ pub struct ServerArgsConfig {
     pub fido: bool,
     #[clap(
         long,
+        value_name = "ID",
+        help = "Stable identifier added to the virtual FIDO phys path for per-session udev isolation"
+    )]
+    pub fido_virtual_id: Option<String>,
+    #[clap(
+        long,
         short = 'r',
         default_value_t = false,
         help = "Transmit Raw sound (not encoded)"

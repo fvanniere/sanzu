@@ -358,9 +358,10 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
         };
 
     let mut fido = match fido_info {
-        Some(info) if arguments.fido => {
-            Some(FidoServer::create(&info).map_err(|err| send_server_err_event(&mut sock, err))?)
-        }
+        Some(info) if arguments.fido => Some(
+            FidoServer::create(&info, arguments.fido_virtual_id.as_deref())
+                .map_err(|err| send_server_err_event(&mut sock, err))?,
+        ),
         Some(_) => {
             return Err(anyhow!(
                 "Client requested FIDO forwarding but the server does not allow it"
