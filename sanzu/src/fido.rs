@@ -381,6 +381,8 @@ impl FidoClient {
             .ok_or_else(|| anyhow!("No active local PIN session"))?;
         let command = payload[0];
         let mut map = decode_map(&payload[1..])?;
+        let consumes_token = command == CTAP_MAKE_CREDENTIAL
+            || (command == CTAP_GET_ASSERTION && get_assertion_tests_presence(&map)?);
         let (permission, hash_key, auth_key, protocol_key, rp_id) = match command {
             CTAP_MAKE_CREDENTIAL => (
                 PIN_PERMISSION_MAKE_CREDENTIAL,
@@ -411,10 +413,12 @@ impl FidoClient {
         map.insert(Value::Integer(auth_key), Value::Bytes(translated));
         payload.truncate(1);
         payload.extend(serde_cbor::to_vec(&Value::Map(map))?);
-        // CTAP clears mc/ga permissions after an operation that tests user
-        // presence. Mirror that behavior in the proxy and erase both tokens
-        // before the physical authenticator is touched.
-        self.pin_session = None;
+        if consumes_token {
+            // CTAP clears mc/ga permissions after an operation that tests user
+            // presence. Silent up=false assertions used by Firefox for
+            // credential filtering may reuse the token for the same RP.
+            self.pin_session = None;
+        }
         Ok(())
     }
 
@@ -797,6 +801,20 @@ fn make_credential_rp_id(map: &BTreeMap<Value, Value>) -> Result<String> {
     }
 }
 
+fn get_assertion_tests_presence(map: &BTreeMap<Value, Value>) -> Result<bool> {
+    let Some(options) = map.get(&Value::Integer(5)) else {
+        return Ok(true);
+    };
+    let Value::Map(options) = options else {
+        return Err(anyhow!("GetAssertion options are not a map"));
+    };
+    match options.get(&Value::Text("up".to_owned())) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(anyhow!("GetAssertion up option is not boolean")),
+        None => Ok(true),
+    }
+}
+
 fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
@@ -809,7 +827,10 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
         return Err(anyhow!("Authenticator GetInfo options are not a map"));
     };
     options.insert(Value::Text("uv".to_owned()), Value::Bool(true));
-    options.insert(Value::Text("clientPin".to_owned()), Value::Bool(false));
+    // Absence means unsupported. Advertising `false` would instead mean that
+    // Client PIN exists but has not been configured, which can trigger a
+    // remote PIN-setup UI in platform implementations.
+    options.remove(&Value::Text("clientPin".to_owned()));
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
     payload.truncate(1);
@@ -1113,10 +1134,7 @@ mod tests {
         let Value::Map(options) = map_value(&info, 4).unwrap() else {
             panic!("options should be a map");
         };
-        assert_eq!(
-            options.get(&Value::Text("clientPin".to_owned())),
-            Some(&Value::Bool(false))
-        );
+        assert_eq!(options.get(&Value::Text("clientPin".to_owned())), None);
         assert_eq!(
             options.get(&Value::Text("uv".to_owned())),
             Some(&Value::Bool(true))
@@ -1152,5 +1170,18 @@ mod tests {
     fn parses_pinentry_assuan_escaping() {
         assert_eq!(decode_assuan_data("12%2034%25").unwrap(), "12 34%");
         assert!(decode_assuan_data("12%2").is_err());
+    }
+
+    #[test]
+    fn keeps_token_for_silent_get_assertion_only() {
+        let silent = map_of([(
+            5,
+            Value::Map(BTreeMap::from([(
+                Value::Text("up".to_owned()),
+                Value::Bool(false),
+            )])),
+        )]);
+        assert!(!get_assertion_tests_presence(&silent).unwrap());
+        assert!(get_assertion_tests_presence(&BTreeMap::new()).unwrap());
     }
 }
