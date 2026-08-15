@@ -2455,7 +2455,7 @@ name = "sanzu-common"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bindgen 0.65.1",
+ "bindgen 0.69.5",
  "byteorder",
  "env_logger",
  "libgssapi",
