@@ -236,7 +236,7 @@ pub struct ClientArgsConfig {
     pub fido: bool,
     #[clap(
         long,
-        help = "FIDO HID device path to forward (for example /dev/hidraw4); also enables --fido"
+        help = "FIDO device selector: HID path, text in manufacturer/product/serial, or hexadecimal VID:PID (for example 1050:0407); also enables --fido"
     )]
     pub fido_device: Option<String>,
     #[clap(long, short = 's', help = "Audio sample rate")]

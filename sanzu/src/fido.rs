@@ -13,6 +13,36 @@ const MAX_REPORTS_PER_CYCLE: usize = 64;
 const FIDO_USAGE_PAGE: u16 = 0xf1d0;
 const FIDO_USAGE: u16 = 0x0001;
 
+#[derive(Debug, PartialEq)]
+enum FidoSelector<'a> {
+    VidPid(u16, u16),
+    Text(&'a str),
+}
+
+impl<'a> FidoSelector<'a> {
+    fn parse(value: &'a str) -> Self {
+        let value = value.trim();
+        let mut parts = value.split(':');
+        if let (Some(vendor), Some(product), None) = (parts.next(), parts.next(), parts.next()) {
+            let vendor = vendor
+                .strip_prefix("0x")
+                .or_else(|| vendor.strip_prefix("0X"))
+                .unwrap_or(vendor);
+            let product = product
+                .strip_prefix("0x")
+                .or_else(|| product.strip_prefix("0X"))
+                .unwrap_or(product);
+            if let (Ok(vendor), Ok(product)) = (
+                u16::from_str_radix(vendor, 16),
+                u16::from_str_radix(product, 16),
+            ) {
+                return Self::VidPid(vendor, product);
+            }
+        }
+        Self::Text(value)
+    }
+}
+
 // Standard unnumbered 64-byte CTAPHID report descriptor from the FIDO CTAP
 // USB HID binding (usage page 0xf1d0, usage 0x01).
 #[cfg(target_os = "linux")]
@@ -46,26 +76,73 @@ impl FidoClient {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
+            let selector = requested_path.map(FidoSelector::parse);
             let mut matches = api
                 .device_list()
                 .filter(|device| {
                     device.usage_page() == FIDO_USAGE_PAGE && device.usage() == FIDO_USAGE
                 })
-                .filter(|device| {
-                    requested_path.map_or(true, |path| device.path().to_string_lossy() == path)
-                });
+                .filter(|device| match selector.as_ref() {
+                    None => true,
+                    Some(FidoSelector::VidPid(vendor, product)) => {
+                        device.vendor_id() == *vendor && device.product_id() == *product
+                    }
+                    Some(FidoSelector::Text(text)) => {
+                        let text = text.to_lowercase();
+                        device
+                            .path()
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(&text)
+                            || device
+                                .manufacturer_string()
+                                .map(|value| value.to_lowercase().contains(&text))
+                                .unwrap_or(false)
+                            || device
+                                .product_string()
+                                .map(|value| value.to_lowercase().contains(&text))
+                                .unwrap_or(false)
+                            || device
+                                .serial_number()
+                                .map(|value| value.to_lowercase().contains(&text))
+                                .unwrap_or(false)
+                    }
+                })
+                .collect::<Vec<_>>();
 
-            let device_info = matches.next().ok_or_else(|| {
-                if let Some(path) = requested_path {
-                    anyhow!("No FIDO HID authenticator found at {path}")
+            if matches.is_empty() {
+                return Err(if let Some(selector) = requested_path {
+                    anyhow!("No FIDO HID authenticator matches {selector:?}")
                 } else {
                     anyhow!("No FIDO HID authenticator found; check the key and hidraw permissions")
-                }
-            })?;
+                });
+            }
 
-            if requested_path.is_none() && matches.next().is_some() {
+            if requested_path.is_some() && matches.len() > 1 {
+                let candidates = matches
+                    .iter()
+                    .map(|device| {
+                        format!(
+                            "{} ({:04x}:{:04x}, {})",
+                            device.product_string().unwrap_or("FIDO authenticator"),
+                            device.vendor_id(),
+                            device.product_id(),
+                            device.path().to_string_lossy()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "FIDO selector {selector:?} is ambiguous; candidates: {candidates}",
+                    selector = requested_path.unwrap_or_default()
+                ));
+            }
+
+            if requested_path.is_none() && matches.len() > 1 {
                 warn!("Several FIDO authenticators found; forwarding the first one. Use --fido-device to select one");
             }
+
+            let device_info = matches.remove(0);
 
             let info = tunnel::FidoDevice {
                 vendor_id: device_info.vendor_id() as u32,
@@ -295,5 +372,21 @@ mod tests {
         assert!(validate_report(&[0; FIDO_REPORT_SIZE]).is_ok());
         assert!(validate_report(&[0; FIDO_REPORT_SIZE - 1]).is_err());
         assert!(validate_report(&[0; FIDO_REPORT_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn parses_vid_pid_selectors() {
+        assert_eq!(
+            FidoSelector::parse("1050:0407"),
+            FidoSelector::VidPid(0x1050, 0x0407)
+        );
+        assert_eq!(
+            FidoSelector::parse("0x1050:0x0407"),
+            FidoSelector::VidPid(0x1050, 0x0407)
+        );
+        assert_eq!(
+            FidoSelector::parse("YubiKey 5"),
+            FidoSelector::Text("YubiKey 5")
+        );
     }
 }

@@ -91,7 +91,17 @@ sanzu_client 192.168.0.1 1122 --fido
 
 # Or select one explicitly on Linux
 sanzu_client 192.168.0.1 1122 --fido-device /dev/hidraw4
+
+# Select by hexadecimal USB vendor/product ID
+sanzu_client 192.168.0.1 1122 --fido-device 1050:0407
+
+# Select by a case-insensitive manufacturer, product, or serial substring
+sanzu_client 192.168.0.1 1122 --fido-device "YubiKey 5"
 ```
+
+If a text or `VID:PID` selector matches several authenticators, Sanzu lists the
+candidates and asks for a more precise selector instead of choosing one
+silently. A serial substring or the HID path can distinguish identical keys.
 
 The client needs access to the physical HID device, and the server needs access
 to `/dev/uhid`. Configure narrow udev permissions for the accounts running
