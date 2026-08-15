@@ -620,7 +620,7 @@ pub fn do_run(
 
         let display_size = client.size();
         let mut msgs = client.poll_events().context("Error in poll_events")?;
-        if let Some(fido_result) = fido.as_ref().map(FidoClient::poll_reports) {
+        if let Some(fido_result) = fido.as_mut().map(FidoClient::poll_reports) {
             match fido_result {
                 Ok(reports) => msgs.fido_reports = reports,
                 Err(err) => {
@@ -653,7 +653,7 @@ pub fn do_run(
 
         let mut img_todo = None;
 
-        if let Some(ref current_fido) = fido {
+        if let Some(ref mut current_fido) = fido {
             if let Err(err) = current_fido.write_reports(msg.fido_reports) {
                 warn!(
                     "Local FIDO authenticator disconnected while writing ({err:#}); suspending FIDO forwarding without closing the video session"

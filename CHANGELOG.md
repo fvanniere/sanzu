@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-15
+
+### Added
+- Prompt for a forwarded authenticator PIN locally on the Sanzu client through
+  pinentry instead of displaying the prompt in the remote Firefox session.
+
+### Security
+- Keep the PIN and the authenticator's real `pinUvAuthToken` on the client.
+- Give remote Firefox a short-lived, RP- and permission-scoped proxy token, and
+  translate only verified make-credential/get-assertion proofs on the client.
+- Reject unsupported remote ClientPIN operations instead of forwarding them to
+  the physical authenticator.
+
 ## [0.2.4] - 2026-08-15
 
 ### Fixed

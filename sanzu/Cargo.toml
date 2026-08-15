@@ -1,6 +1,6 @@
 [package]
 name = "sanzu"
-version = "0.2.4"
+version = "0.2.5"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 readme = "README.md"
@@ -17,7 +17,9 @@ winres = {git = "https://github.com/serpilliere/winres", branch="link_resources"
 
 [dependencies]
 anyhow = "1.0"
+aes = "0.8"
 byteorder = "1.4"
+cbc = "0.1"
 clap = "4.3"
 cpal = "0.15"
 embedded-graphics = "0.8"
@@ -26,20 +28,25 @@ env_logger = "0.10"
 err-derive = "0.3"
 ffmpeg-sys-next = "7.1"
 hound = "3.5"
+hmac = "0.12"
 lazy_static = "1.4"
 libc = "0.2"
 lock_keys = {git="https://github.com/risoflora/lock_keys", rev="38d97697c054d56e40c3975c0add04c33a05e4f4"}
 log = "0.4"
 memmap2 = "0.7"
 opus= "0.3"
+p256 = { version = "0.13", features = ["ecdh"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 rpassword = "7.2"
 rustls = "0.21"
 rustls-pemfile = "1.0"
 sanzu-common = { path="../sanzu-common", default-features = false}
 serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
 serde_derive = "1.0"
 serde_yaml = "0.9"
 spin_sleep = "1.1"
+sha2 = "0.10"
 twelf = {version = "0.11.0", features=["toml"]}
 toml = "0.7"
 dbus = { version = "0.9", optional = true }
@@ -48,6 +55,7 @@ notify-rust = { version = "4.8", features = ["images"], optional = true }
 webpki-roots = "0.23"
 rayon = "1.7"
 x509-parser = "0.15"
+zeroize = "1.8"
 
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
 cpufeatures = "0.2"

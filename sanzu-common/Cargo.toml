@@ -1,6 +1,6 @@
 [package]
 name = "sanzu-common"
-version = "0.2.4"
+version = "0.2.5"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 description = "Sanzu helper code"
