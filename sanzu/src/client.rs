@@ -98,6 +98,85 @@ fn check_cusor_size(width: u32, height: u32, xhot: u32, yhot: u32) -> Result<(u3
     }
 }
 
+fn zoomed_dimension(dimension: u32, zoom: f64) -> u32 {
+    // Video encoders generally require even dimensions. Keep a non-zero minimum
+    // for very small client windows.
+    (((dimension as f64 / zoom).round() as u32).max(2)) & !1
+}
+
+fn scale_coordinate(value: u32, from: u32, to: u32) -> u32 {
+    if from == 0 {
+        return 0;
+    }
+    ((value as u64 * to as u64) / from as u64).min(to.saturating_sub(1) as u64) as u32
+}
+
+fn scale_client_events(
+    msgs: &mut tunnel::MessagesClient,
+    display_size: (u16, u16),
+    remote_size: (u16, u16),
+    zoom: f64,
+) {
+    for msg in &mut msgs.msgs {
+        match &mut msg.msg {
+            Some(tunnel::message_client::Msg::Move(event)) => {
+                event.x = scale_coordinate(event.x, display_size.0 as u32, remote_size.0 as u32);
+                event.y = scale_coordinate(event.y, display_size.1 as u32, remote_size.1 as u32);
+            }
+            Some(tunnel::message_client::Msg::Button(event)) => {
+                event.x = scale_coordinate(event.x, display_size.0 as u32, remote_size.0 as u32);
+                event.y = scale_coordinate(event.y, display_size.1 as u32, remote_size.1 as u32);
+            }
+            Some(tunnel::message_client::Msg::Display(event)) => {
+                event.width = zoomed_dimension(event.width, zoom);
+                event.height = zoomed_dimension(event.height, zoom);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scale_signed(value: i32, from: u32, to: u32) -> i32 {
+    if from == 0 {
+        return value;
+    }
+    ((value as i64 * to as i64) / from as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+}
+
+fn scale_length(value: u32, from: u32, to: u32) -> u32 {
+    if from == 0 {
+        return value;
+    }
+    ((value as u64 * to as u64) / from as u64).min(u32::MAX as u64) as u32
+}
+
+fn scale_area(area: &mut Area, remote_size: (u16, u16), display_size: (u16, u16)) {
+    area.position.0 = scale_signed(
+        area.position.0 as i32,
+        remote_size.0 as u32,
+        display_size.0 as u32,
+    )
+    .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    area.position.1 = scale_signed(
+        area.position.1 as i32,
+        remote_size.1 as u32,
+        display_size.1 as u32,
+    )
+    .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    area.size.0 = scale_length(
+        area.size.0 as u32,
+        remote_size.0 as u32,
+        display_size.0 as u32,
+    )
+    .max(1) as u16;
+    area.size.1 = scale_length(
+        area.size.1 as u32,
+        remote_size.1 as u32,
+        display_size.1 as u32,
+    )
+    .max(1) as u16;
+}
+
 pub trait ClientInterface {
     fn pam_echo(&mut self, echo: String) -> Result<String>;
 
@@ -185,6 +264,11 @@ pub fn do_run(
     arguments: &ClientArgsConfig,
     client_interface: &mut impl ClientInterface,
 ) -> Result<()> {
+    if !arguments.zoom.is_finite() || arguments.zoom < 1.0 {
+        return Err(anyhow!(
+            "Zoom must be a finite number greater than or equal to 1"
+        ));
+    }
     let mut sound_obj = if arguments.audio {
         Some(
             SoundDecoder::new(
@@ -409,6 +493,12 @@ pub fn do_run(
         }
     };
 
+    if server_size.is_some() && arguments.zoom != 1.0 {
+        return Err(anyhow!(
+            "Zoom requires adaptive server resolution; restart the server without --keep-server-resolution"
+        ));
+    }
+
     #[cfg(unix)]
     let mut client = init_x11rb(arguments, seamless, server_size)
         .context("Error in init_x11rb")
@@ -431,8 +521,8 @@ pub fn do_run(
         }
         None => {
             let (width, height) = client.size();
-            let width_even = width as u32 & !1;
-            let height_event = height as u32 & !1;
+            let width_even = zoomed_dimension(width as u32, arguments.zoom);
+            let height_event = zoomed_dimension(height as u32, arguments.zoom);
             let client_hello = tunnel::ClientHelloResolution {
                 audio,
                 audio_sample_rate,
@@ -441,7 +531,7 @@ pub fn do_run(
             };
             send_client_msg_type!(server, client_hello, Clienthelloresolution)
                 .context("Error in send ClientHelloResolution")?;
-            (width, height)
+            (width_even as u16, height_event as u16)
         }
     };
 
@@ -463,7 +553,14 @@ pub fn do_run(
         let mut areas = HashMap::new();
         let time_start = Instant::now();
 
-        let msgs = client.poll_events().context("Error in poll_events")?;
+        let display_size = client.size();
+        let mut msgs = client.poll_events().context("Error in poll_events")?;
+        scale_client_events(
+            &mut msgs,
+            display_size,
+            (img_width, img_height),
+            arguments.zoom,
+        );
 
         let time_events = Instant::now();
 
@@ -663,6 +760,10 @@ pub fn do_run(
             }
         }
 
+        let display_size = client.size();
+        for area in areas.values_mut() {
+            scale_area(area, (img_width, img_height), display_size);
+        }
         client.update(&areas).context("Error in update")?;
 
         let time_stop = Instant::now();
@@ -687,5 +788,28 @@ pub fn do_run(
             &format!("{:.1?}", time_decode_msgs - time_recv),
             &times_img,
         );
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    #[test]
+    fn zoom_two_turns_4k_into_1080p() {
+        assert_eq!(zoomed_dimension(3840, 2.0), 1920);
+        assert_eq!(zoomed_dimension(2160, 2.0), 1080);
+    }
+
+    #[test]
+    fn zoom_dimensions_are_even() {
+        assert_eq!(zoomed_dimension(1921, 1.5), 1280);
+        assert_eq!(zoomed_dimension(3, 2.0), 2);
+    }
+
+    #[test]
+    fn pointer_coordinates_are_mapped_back_to_remote_space() {
+        assert_eq!(scale_coordinate(1920, 3840, 1920), 960);
+        assert_eq!(scale_coordinate(3839, 3840, 1920), 1919);
     }
 }

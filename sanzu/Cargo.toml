@@ -1,6 +1,6 @@
 [package]
 name = "sanzu"
-version = "0.1.4"
+version = "0.2.0"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 readme = "README.md"
@@ -21,7 +21,7 @@ embedded-graphics = "0.8"
 encoding_rs = "0.8"
 env_logger = "0.10"
 err-derive = "0.3"
-ffmpeg-sys-next = "6.0"
+ffmpeg-sys-next = "7.1"
 hound = "3.5"
 lazy_static = "1.4"
 libc = "0.2"

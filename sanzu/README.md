@@ -55,6 +55,20 @@ You can find more information on the architecture in `doc/architecture.md`.
 ```
 By default, sound is disabled. To enable it, server and client should be launched with option "--audio".
 
+### Client-side zoom
+
+On a high-DPI display, the client can ask the server for a smaller remote desktop and upscale it
+locally. For example, a zoom factor of 2 displays a 1920x1080 encoded desktop over a 3840x2160
+client display:
+
+```
+./sanzu_client 192.168.0.1 1122 --zoom 2
+```
+
+Mouse coordinates, resized windows, and seamless areas are scaled automatically. Zoom requires
+the server's adaptive-resolution mode (the default); it is incompatible with
+`--keep-server-resolution`.
+
 ## Replacement of ssh -Y
 If you have a server, let's say Rochefort, which runs a X server on the display :1234, you can access it with:
 ```

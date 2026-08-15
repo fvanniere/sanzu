@@ -271,6 +271,12 @@ pub struct ClientArgsConfig {
     pub window_mode: bool,
     #[clap(
         long,
+        default_value_t = 1.0,
+        help = "Client display zoom. For example, 2 makes a 4K client request and decode a 2K remote desktop"
+    )]
+    pub zoom: f64,
+    #[clap(
+        long,
         short = 'd',
         help = "Force decoder name (libx264, h264_qsv, ...) (must be compatible with selected encoder)"
     )]

@@ -36,7 +36,7 @@ use winapi::{
         d3d9types::{
             D3DBACKBUFFER_TYPE_MONO, D3DCLEAR_TARGET, D3DCOLOR_XRGB, D3DDEVTYPE_HAL,
             D3DFMT_UNKNOWN, D3DFMT_X8R8G8B8, D3DLOCKED_RECT, D3DPOOL_DEFAULT,
-            D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3DTEXF_NONE,
+            D3DPRESENT_PARAMETERS, D3DSWAPEFFECT_DISCARD, D3DTEXF_LINEAR, D3DTEXF_NONE,
         },
         minwindef::{DWORD, LPARAM, LRESULT, TRUE, UINT, WPARAM},
         windef::{HWND, HWND__, POINT, RECT},
@@ -67,7 +67,7 @@ use winapi::{
     },
 };
 
-type FrameReceiver = Receiver<(Vec<u8>, u32, u32)>;
+type FrameReceiver = Receiver<(Vec<u8>, u32, u32, u32, u32)>;
 type CursorReceiver = Receiver<(Vec<u8>, u32, u32, i32, i32)>;
 
 lazy_static! {
@@ -75,6 +75,7 @@ lazy_static! {
     static ref WIN_ID_TO_HANDLE: Mutex<HashMap<usize, u64>> = Mutex::new(HashMap::new());
     static ref HANDLE_TO_WIN_ID: Mutex<HashMap<u64, usize>> = Mutex::new(HashMap::new());
     static ref SCREEN_SIZE: Mutex<(u32, u32)> = Mutex::new((0, 0));
+    static ref DISPLAY_SIZE: Mutex<(u32, u32)> = Mutex::new((0, 0));
     static ref EVENT_SENDER: Mutex<Option<Sender<tunnel::MessageClient>>> = Mutex::new(None);
     static ref SESSION_SENDER: Mutex<Option<Sender<()>>> = Mutex::new(None);
     static ref CURSOR_RECEIVER: Mutex<Option<CursorReceiver>> = Mutex::new(None);
@@ -226,7 +227,7 @@ pub fn set_region_clipping(hwnd: HWND, zones: &[Area]) -> Result<()> {
 }
 
 pub struct ClientWindows {
-    pub frame_sender: SyncSender<(Vec<u8>, u32, u32)>,
+    pub frame_sender: SyncSender<(Vec<u8>, u32, u32, u32, u32)>,
     pub cursor_sender: Sender<(Vec<u8>, u32, u32, i32, i32)>,
     pub event_receiver: Receiver<tunnel::MessageClient>,
     pub shape_sender: Sender<Vec<Area>>,
@@ -274,6 +275,8 @@ impl ClientWindows {
                 (width as u16, height as u16)
             }
         };
+
+        *DISPLAY_SIZE.lock().unwrap() = (width as u32, height as u32);
 
         *SYNC_KEY_LOCKS_NEEDED.lock().unwrap() = true;
 
@@ -497,6 +500,8 @@ unsafe fn render(
     data: Vec<u8>,
     width: u32,
     height: u32,
+    display_width: u32,
+    display_height: u32,
 ) -> Result<()> {
     let mut d3d_rect = D3DLOCKED_RECT::default();
     let device = sanzu_direct3d
@@ -570,12 +575,18 @@ unsafe fn render(
 
     let mut back_buffer = Direct3DSurface::new(p_back_buffer);
 
-    /* Use rect with img size to avoid stretching */
+    /* Direct3D performs the client-side zoom into the display back buffer. */
     let new_rect = RECT {
         left: 0,
         top: 0,
-        right: width as i32,
-        bottom: height as i32,
+        right: display_width as i32,
+        bottom: display_height as i32,
+    };
+
+    let filter = if (width, height) == (display_width, display_height) {
+        D3DTEXF_NONE
+    } else {
+        D3DTEXF_LINEAR
     };
 
     let ret = device.StretchRect(
@@ -583,7 +594,7 @@ unsafe fn render(
         null_mut(),
         back_buffer.get_inner(),
         &new_rect as *const _,
-        D3DTEXF_NONE,
+        filter,
     );
     if ret != 0 {
         return Err(anyhow!(
@@ -940,7 +951,7 @@ extern "system" fn custom_wnd_proc(
             info!("Session change state {:?} {:?}", lparam, wparam);
             if wparam as u32 == WTS_SESSION_UNLOCK {
                 // Force d3d re init
-                let (width, height) = *SCREEN_SIZE.lock().unwrap();
+                let (width, height) = *DISPLAY_SIZE.lock().unwrap();
                 let msg = tunnel::EventDisplay {
                     width: width as u32,
                     height: height as u32,
@@ -969,6 +980,9 @@ extern "system" fn custom_wnd_proc(
             let height = (lparam >> 16) & 0xFFFF;
 
             info!("Resolution change {}x{}", width, height);
+            if width != 0 && height != 0 {
+                *DISPLAY_SIZE.lock().unwrap() = (width as u32, height as u32);
+            }
             let msg = tunnel::EventDisplay {
                 width: width as u32,
                 height: height as u32,
@@ -1369,7 +1383,9 @@ pub fn init_wind3d(
         thread::spawn(move || {
             let mut sanzu_direct3d = None;
             loop {
-                if let Ok((data, width, height)) = frame_receiver.recv() {
+                if let Ok((data, width, height, display_width, display_height)) =
+                    frame_receiver.recv()
+                {
                     if (width, height) != *SCREEN_SIZE.lock().unwrap()
                         || session_receiver.try_recv().is_ok()
                     {
@@ -1387,7 +1403,16 @@ pub fn init_wind3d(
                     }
                     let result = {
                         if let Some(sanzu_direct3d) = sanzu_direct3d.as_mut() {
-                            unsafe { render(sanzu_direct3d, data, width, height) }
+                            unsafe {
+                                render(
+                                    sanzu_direct3d,
+                                    data,
+                                    width,
+                                    height,
+                                    display_width,
+                                    display_height,
+                                )
+                            }
                         } else {
                             Err(anyhow!("No sanzu obj"))
                         }
@@ -1532,7 +1557,13 @@ impl Client for ClientWindows {
 
     fn set_img(&mut self, img: &[u8], size: (u32, u32)) -> Result<()> {
         self.frame_sender
-            .send((img.to_owned(), size.0, size.1))
+            .send((
+                img.to_owned(),
+                size.0,
+                size.1,
+                self.width as u32,
+                self.height as u32,
+            ))
             .context("Cannot send frame")
     }
 
@@ -1657,6 +1688,17 @@ impl Client for ClientWindows {
                         Some(tunnel::message_client::Msg::Clipboard(tunnel::EventClipboard { data })),
                 } => {
                     self.clipboard_last_value = Some(data);
+                }
+                event @ tunnel::MessageClient {
+                    msg: Some(tunnel::message_client::Msg::Display(_)),
+                } => {
+                    if let Some(tunnel::message_client::Msg::Display(display)) = &event.msg {
+                        if display.width != 0 && display.height != 0 {
+                            self.width = display.width as u16;
+                            self.height = display.height as u16;
+                        }
+                    }
+                    events.push(event);
                 }
                 _ => events.push(event),
             }

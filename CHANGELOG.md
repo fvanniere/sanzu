@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-15
+
+### Added
+- Client-side zoom to encode a smaller adaptive remote desktop and upscale it locally.
+- GitLab CI/CD packaging for Debian 13 (Trixie), with tagged releases published to the generic package registry.
+
+### Changed
+- Update FFmpeg bindings to 7.1 for Debian Trixie compatibility.
+
 ## [0.1.4] - 2023-05-31
 
 ### Changed

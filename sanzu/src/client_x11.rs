@@ -116,6 +116,10 @@ pub struct ClientInfo {
     pub grab_keyboard: bool,
     /// Stores bgra format id for cursor picture
     pub bgra_format_id: u32,
+    /// XRender format used by the client window and its frame pixmap.
+    pub window_format_id: u32,
+    /// Size of the last decoded (remote) frame stored in the pixmap.
+    pub frame_size: (u16, u16),
 }
 
 fn create_gc<C: Connection>(
@@ -405,6 +409,19 @@ pub fn init_x11rb(
         }
     }
 
+    let window_format_id = render_pict_format
+        .screens
+        .get(screen_num)
+        .and_then(|pict_screen| {
+            pict_screen
+                .depths
+                .iter()
+                .flat_map(|depth| depth.visuals.iter())
+                .find(|visual| visual.visual == screen.root_visual)
+        })
+        .map(|visual| visual.format)
+        .context("Cannot find XRender format for client window")?;
+
     let clipboard = Clipboard::new().context("Error in clipboard creation")?;
     let root = screen.root;
     let client_info = ClientInfo {
@@ -432,6 +449,8 @@ pub fn init_x11rb(
         areas: vec![],
         grab_keyboard: arguments.grab_keyboard,
         bgra_format_id,
+        window_format_id,
+        frame_size: (width, height),
     };
 
     Ok(Box::new(client_info))
@@ -733,6 +752,27 @@ impl Client for ClientInfo {
 
     fn set_img(&mut self, img: &[u8], size: (u32, u32)) -> Result<()> {
         self.need_update = true;
+        let frame_size = (size.0 as u16, size.1 as u16);
+        if frame_size != self.frame_size {
+            let pixmap = self
+                .conn
+                .generate_id()
+                .context("Cannot generate resized pixmap id")?;
+            self.conn
+                .create_pixmap(
+                    self.conn.setup().roots[self.screen_num].root_depth,
+                    pixmap,
+                    self.window_info.window,
+                    frame_size.0,
+                    frame_size.1,
+                )
+                .context("Cannot create frame pixmap")?;
+            self.conn
+                .free_pixmap(self.window_info.pixmap)
+                .context("Cannot free old frame pixmap")?;
+            self.window_info.pixmap = pixmap;
+            self.frame_size = frame_size;
+        }
         put_frame(self, img, size.0, size.1)
     }
 
@@ -750,11 +790,58 @@ impl Client for ClientInfo {
                     self.areas = distant_areas;
                 }
             }
-            self.conn
-                .copy_area(
+            if self.frame_size == self.window_info.size {
+                self.conn
+                    .copy_area(
+                        self.window_info.pixmap,
+                        self.window_info.window,
+                        self.black_gc,
+                        0,
+                        0,
+                        0,
+                        0,
+                        self.window_info.size.0,
+                        self.window_info.size.1,
+                    )
+                    .context("Error in copy_area")?;
+            } else {
+                let source = render::PictureWrapper::create_picture(
+                    &self.conn,
                     self.window_info.pixmap,
+                    self.window_format_id,
+                    &render::CreatePictureAux::default(),
+                )
+                .context("Cannot create XRender source picture")?;
+                let destination = render::PictureWrapper::create_picture(
+                    &self.conn,
                     self.window_info.window,
-                    self.black_gc,
+                    self.window_format_id,
+                    &render::CreatePictureAux::default(),
+                )
+                .context("Cannot create XRender destination picture")?;
+                let fixed_one = 1_i32 << 16;
+                let transform = render::Transform {
+                    matrix11: ((self.frame_size.0 as f64 / self.window_info.size.0 as f64)
+                        * fixed_one as f64)
+                        .round() as i32,
+                    matrix22: ((self.frame_size.1 as f64 / self.window_info.size.1 as f64)
+                        * fixed_one as f64)
+                        .round() as i32,
+                    matrix33: fixed_one,
+                    ..Default::default()
+                };
+                render::set_picture_transform(&self.conn, source.picture(), transform)
+                    .context("Cannot set XRender zoom transform")?;
+                render::set_picture_filter(&self.conn, source.picture(), b"bilinear", &[])
+                    .context("Cannot set XRender zoom filter")?;
+                render::composite(
+                    &self.conn,
+                    render::PictOp::SRC,
+                    source.picture(),
+                    0_u32,
+                    destination.picture(),
+                    0,
+                    0,
                     0,
                     0,
                     0,
@@ -762,7 +849,8 @@ impl Client for ClientInfo {
                     self.window_info.size.0,
                     self.window_info.size.1,
                 )
-                .context("Error in copy_area")?;
+                .context("Cannot render zoomed frame")?;
+            }
             self.need_update = false;
             self.conn.flush().context("Error in x11rb flush")?;
         }
@@ -962,7 +1050,8 @@ impl Client for ClientInfo {
                 Event::ConfigureNotify(event) => {
                     warn!("Resize {:?}", event);
                     let (width, height) = (event.width, event.height);
-                    if width != self.width || height != self.height {
+                    if width != 0 && height != 0 && (width != self.width || height != self.height) {
+                        self.window_info.size = (width, height);
                         let msg = tunnel::EventDisplay {
                             width: width as u32,
                             height: height as u32,

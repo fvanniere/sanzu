@@ -1,0 +1,73 @@
+stages:
+  - package
+  - publish
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  RUSTUP_HOME: $CI_PROJECT_DIR/.rustup
+  DEBIAN_PACKAGE_DIR: dist/debian-trixie
+  GENERIC_PACKAGE_NAME: sanzu-debian-trixie
+
+package:debian:trixie:
+  stage: package
+  image: debian:trixie-slim
+  cache:
+    key: cargo-debian-trixie-rust-1.79-cargo-deb-2.9.2
+    paths:
+      - .cargo/bin/
+      - .cargo/git/db/
+      - .cargo/registry/cache/
+      - .cargo/registry/index/
+  before_script:
+    - apt-get update
+    - >-
+      apt-get install -y --no-install-recommends
+      ca-certificates clang cmake curl dpkg-dev ffmpeg g++ git libasound2-dev
+      libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev
+      libclang-dev libdbus-1-dev libkrb5-dev libpam0g-dev libx264-dev
+      libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      libxdamage-dev libxext-dev pkg-config protobuf-compiler
+    - rm -rf /var/lib/apt/lists/*
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.79.0
+    - export PATH="${CARGO_HOME}/bin:${PATH}"
+    - cargo deb --version >/dev/null 2>&1 || cargo install cargo-deb --version 2.9.2 --locked
+  script:
+    - mkdir -p "${DEBIAN_PACKAGE_DIR}"
+    - cargo deb -p sanzu -- --release --locked
+    - cargo deb -p sanzu --variant=client -- --release --locked
+    - cargo deb -p sanzu_broker -- --release --locked
+    - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
+    - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
+    - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
+    - find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' -print
+  artifacts:
+    name: "sanzu-debian-trixie-${CI_COMMIT_REF_SLUG}"
+    paths:
+      - dist/debian-trixie/*.deb
+    expire_in: 30 days
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+publish:debian:trixie:
+  stage: publish
+  image:
+    name: curlimages/curl:8.12.1
+    entrypoint: [""]
+  needs:
+    - job: package:debian:trixie
+      artifacts: true
+  script:
+    - PACKAGE_VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' sanzu/Cargo.toml | head -n 1)"
+    - test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
+    - |
+      for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do
+        filename="$(basename "${package}")"
+        curl --fail-with-body --location \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "${package}" \
+          "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${GENERIC_PACKAGE_NAME}/${PACKAGE_VERSION}/${filename}"
+      done
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
