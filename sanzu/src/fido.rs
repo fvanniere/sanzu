@@ -374,27 +374,36 @@ impl FidoClient {
 
     #[cfg(any(target_os = "linux", windows))]
     fn translate_pin_proof(&mut self, payload: &mut Vec<u8>) -> Result<()> {
+        let command = payload[0];
+        let mut map = decode_map(&payload[1..])?;
+        let auth_key = match command {
+            CTAP_MAKE_CREDENTIAL => 8,
+            CTAP_GET_ASSERTION => 6,
+            _ => return Err(anyhow!("Unsupported PIN-authenticated command")),
+        };
+        // UV-discouraged and otherwise unprotected WebAuthn operations do not
+        // carry pinUvAuthParam. They remain ordinary CTAP forwarding and must
+        // not require a broker session.
+        if !map.contains_key(&Value::Integer(auth_key)) {
+            return Ok(());
+        }
         self.expire_pin_session();
         let session = self
             .pin_session
             .as_ref()
             .ok_or_else(|| anyhow!("No active local PIN session"))?;
-        let command = payload[0];
-        let mut map = decode_map(&payload[1..])?;
         let consumes_token = command == CTAP_MAKE_CREDENTIAL
             || (command == CTAP_GET_ASSERTION && get_assertion_tests_presence(&map)?);
-        let (permission, hash_key, auth_key, protocol_key, rp_id) = match command {
+        let (permission, hash_key, protocol_key, rp_id) = match command {
             CTAP_MAKE_CREDENTIAL => (
                 PIN_PERMISSION_MAKE_CREDENTIAL,
                 1,
-                8,
                 9,
                 make_credential_rp_id(&map)?,
             ),
             CTAP_GET_ASSERTION => (
                 PIN_PERMISSION_GET_ASSERTION,
                 2,
-                6,
                 7,
                 map_text(&map, 1)?.to_owned(),
             ),
