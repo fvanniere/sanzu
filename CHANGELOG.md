@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-15
+
+### Added
+- Add metadata-only diagnostic logs for forwarded FIDO PIN/UV operations. The
+  logs never include PINs, tokens, keys, relying-party identifiers, or CBOR
+  payloads.
+
 ## [0.2.5] - 2026-08-15
 
 ### Added

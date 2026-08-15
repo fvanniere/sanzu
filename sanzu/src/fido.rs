@@ -237,6 +237,7 @@ impl FidoClient {
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
                         advertise_local_pin_broker(&mut message.payload)?;
+                        info!("FIDO GetInfo response exposes the local PIN broker");
                     }
                     self.output.extend(fragment_message(&message)?);
                 }
@@ -272,10 +273,16 @@ impl FidoClient {
 
         match message.payload[0] {
             CTAP_GET_INFO => {
+                info!("FIDO request: GetInfo");
                 self.pending_get_info.insert(message.cid);
                 self.write_message(&message)
             }
             CTAP_CLIENT_PIN => {
+                if let Ok(map) = decode_map(&message.payload[1..]) {
+                    if let Ok(subcommand) = map_u8(&map, 2) {
+                        info!("FIDO request: ClientPIN subcommand 0x{subcommand:02x}");
+                    }
+                }
                 let response = match self.handle_client_pin(message.cid, &message.payload[1..]) {
                     Ok(response) => response,
                     Err(err) => {
@@ -286,6 +293,12 @@ impl FidoClient {
                 self.queue_cbor_response(message.cid, response)
             }
             CTAP_MAKE_CREDENTIAL | CTAP_GET_ASSERTION => {
+                let operation = if message.payload[0] == CTAP_MAKE_CREDENTIAL {
+                    "MakeCredential"
+                } else {
+                    "GetAssertion"
+                };
+                info!("FIDO request: {operation}");
                 match self.translate_pin_proof(&mut message.payload) {
                     Ok(()) => self.write_message(&message),
                     Err(err) => {
@@ -338,12 +351,14 @@ impl FidoClient {
             rp_id,
             expires_at: Instant::now() + PIN_TOKEN_LIFETIME,
         });
+        info!("FIDO local PIN broker issued a scoped proxy token");
         Ok(ctap_success(map_of([(2, Value::Bytes(encrypted))]))?)
     }
 
     #[cfg(any(target_os = "linux", windows))]
     fn obtain_physical_pin_token(&mut self, cid: u32) -> Result<Zeroizing<Vec<u8>>> {
         for _ in 0..3 {
+            info!("FIDO local PIN broker is opening pinentry on the client");
             let pin = prompt_for_pin()?;
             let physical_secret = SecretKey::random(&mut OsRng);
             let agreement_request =
@@ -367,6 +382,7 @@ impl FidoClient {
             }
             let token_map = successful_map(&token_response, "physical PIN token")?;
             let encrypted = map_bytes(&token_map, 2)?;
+            info!("FIDO authenticator accepted the locally entered PIN");
             return Ok(Zeroizing::new(aes_cbc_decrypt(&secret[..], encrypted)?));
         }
         Err(anyhow!("The authenticator rejected the PIN"))
@@ -428,6 +444,7 @@ impl FidoClient {
             // credential filtering may reuse the token for the same RP.
             self.pin_session = None;
         }
+        info!("FIDO PIN/UV proof translated on the client");
         Ok(())
     }
 
