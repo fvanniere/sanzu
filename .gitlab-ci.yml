@@ -31,9 +31,9 @@ package:debian:trixie:
     - cargo deb --version >/dev/null 2>&1 || cargo install cargo-deb --version 2.9.2 --locked
   script:
     - mkdir -p "${DEBIAN_PACKAGE_DIR}"
-    - cargo deb -p sanzu -- --release --locked
-    - cargo deb -p sanzu --variant=client -- --release --locked
-    - cargo deb -p sanzu_broker -- --release --locked
+    - cargo deb --locked -p sanzu
+    - cargo deb --locked -p sanzu --variant=client
+    - cargo deb --locked -p sanzu_broker
     - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
     - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
     - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
