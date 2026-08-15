@@ -846,6 +846,19 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
         return Ok(());
     }
     let mut info = decode_map(&payload[1..])?;
+    let versions = info
+        .entry(Value::Integer(1))
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(versions) = versions else {
+        return Err(anyhow!("Authenticator GetInfo versions are not an array"));
+    };
+    let fido_2_1 = Value::Text("FIDO_2_1".to_owned());
+    if !versions.contains(&fido_2_1) {
+        // pinUvAuthToken and its permission-scoped ClientPIN subcommands are
+        // CTAP 2.1 semantics. Firefox discards an internally inconsistent
+        // GetInfo response before issuing any credential operation.
+        versions.push(fido_2_1);
+    }
     let options = info
         .entry(Value::Integer(4))
         .or_insert_with(|| Value::Map(BTreeMap::new()));
@@ -1154,9 +1167,18 @@ mod tests {
             (Value::Text("clientPin".to_owned()), Value::Bool(true)),
             (Value::Text("uv".to_owned()), Value::Bool(false)),
         ]);
-        let mut payload = ctap_success(map_of([(4, Value::Map(options))])).unwrap();
+        let mut payload = ctap_success(map_of([
+            (1, Value::Array(vec![Value::Text("FIDO_2_0".to_owned())])),
+            (4, Value::Map(options)),
+        ]))
+        .unwrap();
         advertise_local_pin_broker(&mut payload).unwrap();
         let info = successful_map(&payload, "test").unwrap();
+        let Value::Array(versions) = map_value(&info, 1).unwrap() else {
+            panic!("versions should be an array");
+        };
+        assert!(versions.contains(&Value::Text("FIDO_2_0".to_owned())));
+        assert!(versions.contains(&Value::Text("FIDO_2_1".to_owned())));
         let Value::Map(options) = map_value(&info, 4).unwrap() else {
             panic!("options should be a map");
         };

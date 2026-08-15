@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-08-15
+
+### Fixed
+- Advertise `FIDO_2_1` together with the local broker's CTAP 2.1
+  `pinUvAuthToken` capability so Firefox accepts the proxied authenticator.
+
 ## [0.2.6] - 2026-08-15
 
 ### Added
