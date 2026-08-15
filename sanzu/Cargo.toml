@@ -9,6 +9,9 @@ license = "GPL-3.0"
 
 [build-dependencies]
 bindgen = "0.65"
+# uhidrs-sys disables Bindgen's defaults; force the runtime libclang loader
+# for its exact Bindgen version in the unified build graph.
+bindgen-uhid = { package = "bindgen", version = "=0.71.1", default-features = false, features = ["runtime"] }
 cc = "1.0"
 winres = {git = "https://github.com/serpilliere/winres", branch="link_resources"}
 

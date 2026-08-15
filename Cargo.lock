@@ -2469,6 +2469,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "bindgen 0.65.1",
+ "bindgen 0.71.1",
  "byteorder",
  "cc",
  "clap",
