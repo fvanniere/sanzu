@@ -4,15 +4,14 @@ stages:
 
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  RUSTUP_HOME: $CI_PROJECT_DIR/.rustup
   DEBIAN_PACKAGE_DIR: dist/debian-trixie
   GENERIC_PACKAGE_NAME: sanzu-debian-trixie
 
 package:debian:trixie:
   stage: package
-  image: debian:trixie-slim
+  image: rust:1-trixie
   cache:
-    key: cargo-debian-trixie-rust-1.79-cargo-deb-2.9.2
+    key: cargo-debian-trixie-rust-1-cargo-deb-2.9.2
     paths:
       - .cargo/bin/
       - .cargo/git/db/
@@ -22,13 +21,12 @@ package:debian:trixie:
     - apt-get update
     - >-
       apt-get install -y --no-install-recommends
-      ca-certificates clang cmake curl dpkg-dev ffmpeg g++ git libasound2-dev
+      ca-certificates clang cmake dpkg-dev ffmpeg g++ git libasound2-dev
       libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev
       libclang-dev libdbus-1-dev libkrb5-dev libpam0g-dev libx264-dev
       libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       libxdamage-dev libxext-dev pkg-config protobuf-compiler
     - rm -rf /var/lib/apt/lists/*
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.79.0
     - export PATH="${CARGO_HOME}/bin:${PATH}"
     - cargo deb --version >/dev/null 2>&1 || cargo install cargo-deb --version 2.9.2 --locked
   script:
