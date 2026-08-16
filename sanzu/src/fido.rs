@@ -32,6 +32,15 @@ const CTAP_GET_INFO: u8 = 0x04;
 const CTAP_CLIENT_PIN: u8 = 0x06;
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_GET_ASSERTION: u8 = 0x02;
+const CLIENT_PIN_GET_PIN_RETRIES: u8 = 0x01;
+const CLIENT_PIN_GET_KEY_AGREEMENT: u8 = 0x02;
+const CLIENT_PIN_GET_PIN_TOKEN: u8 = 0x05;
+const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x06;
+const CLIENT_PIN_GET_UV_RETRIES: u8 = 0x07;
+const CLIENT_PIN_TOKEN_USING_UV: u8 = 0x09;
+// Reported when the authenticator refuses to disclose its own counter; the
+// value only sizes the remaining attempts a platform is willing to offer.
+const DEFAULT_UV_RETRIES: u8 = 8;
 const CTAP2_OK: u8 = 0x00;
 const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
 const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
@@ -318,14 +327,54 @@ impl FidoClient {
     fn handle_client_pin(&mut self, cid: u32, cbor: &[u8]) -> Result<Vec<u8>> {
         let map = decode_map(cbor).context("Invalid ClientPIN request")?;
         require_protocol_one(&map)?;
-        match map_u8(&map, 2)? {
-            0x02 => {
+        let subcommand = map_u8(&map, 2)?;
+        match client_pin_action(subcommand) {
+            ClientPinAction::KeyAgreement => {
                 let key = cose_public_key(&self.proxy_secret.public_key());
                 Ok(ctap_success(map_of([(1, key)]))?)
             }
-            0x06 => self.issue_proxy_token(cid, &map),
-            _ => Ok(ctap_error(CTAP2_ERR_INVALID_SUBCOMMAND)),
+            ClientPinAction::PinRetries => self.pin_retries(cid),
+            ClientPinAction::UvRetries => self.uv_retries(cid),
+            ClientPinAction::IssueToken => self.issue_proxy_token(cid, &map),
+            ClientPinAction::Unsupported => {
+                warn!("Unsupported remote FIDO ClientPIN subcommand 0x{subcommand:02x}");
+                Ok(ctap_error(CTAP2_ERR_INVALID_SUBCOMMAND))
+            }
         }
+    }
+
+    /// Relayed verbatim: the authenticator is the only thing that knows how
+    /// many attempts are left, and the answer carries no secret.
+    #[cfg(any(target_os = "linux", windows))]
+    fn pin_retries(&mut self, cid: u32) -> Result<Vec<u8>> {
+        let request = encode_client_pin(map_of([
+            (1, Value::Integer(1)),
+            (2, Value::Integer(CLIENT_PIN_GET_PIN_RETRIES as i128)),
+        ]))?;
+        self.physical_transact(cid, request)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn uv_retries(&mut self, cid: u32) -> Result<Vec<u8>> {
+        let retries = match self.physical_pin_retries(cid) {
+            Ok(retries) => retries,
+            Err(err) => {
+                debug!("Cannot read the authenticator retry counter: {err:#}");
+                DEFAULT_UV_RETRIES
+            }
+        };
+        Ok(ctap_success(map_of([(5, Value::Integer(retries as i128))]))?)
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    fn physical_pin_retries(&mut self, cid: u32) -> Result<u8> {
+        let request = encode_client_pin(map_of([
+            (1, Value::Integer(1)),
+            (2, Value::Integer(CLIENT_PIN_GET_PIN_RETRIES as i128)),
+        ]))?;
+        let response = self.physical_transact(cid, request)?;
+        let map = successful_map(&response, "physical PIN retries")?;
+        map_u8(&map, 3)
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -361,8 +410,10 @@ impl FidoClient {
             info!("FIDO local PIN broker is opening pinentry on the client");
             let pin = prompt_for_pin()?;
             let physical_secret = SecretKey::random(&mut OsRng);
-            let agreement_request =
-                encode_client_pin(map_of([(1, Value::Integer(1)), (2, Value::Integer(2))]))?;
+            let agreement_request = encode_client_pin(map_of([
+                (1, Value::Integer(1)),
+                (2, Value::Integer(CLIENT_PIN_GET_KEY_AGREEMENT as i128)),
+            ]))?;
             let agreement_response = self.physical_transact(cid, agreement_request)?;
             let agreement = successful_map(&agreement_response, "physical key agreement")?;
             let authenticator_key = parse_cose_public(map_value(&agreement, 1)?)?;
@@ -372,7 +423,7 @@ impl FidoClient {
             let pin_hash_enc = aes_cbc_encrypt(&secret[..], &digest[..16])?;
             let token_request = encode_client_pin(map_of([
                 (1, Value::Integer(1)),
-                (2, Value::Integer(5)),
+                (2, Value::Integer(CLIENT_PIN_GET_PIN_TOKEN as i128)),
                 (3, cose_public_key(&physical_secret.public_key())),
                 (6, Value::Bytes(pin_hash_enc)),
             ]))?;
@@ -688,6 +739,37 @@ fn map_text(map: &BTreeMap<Value, Value>, key: i128) -> Result<&str> {
     match map_value(map, key)? {
         Value::Text(value) => Ok(value),
         _ => Err(anyhow!("CBOR map key {key} is not text")),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ClientPinAction {
+    KeyAgreement,
+    PinRetries,
+    UvRetries,
+    IssueToken,
+    Unsupported,
+}
+
+/// Which ClientPIN subcommands the local broker answers, given the GetInfo it
+/// advertises. Hiding `clientPin` while offering `uv` and `pinUvAuthToken`
+/// makes a CTAP 2.1 platform verify through the built-in method, so the token
+/// request arrives as `getPinUvAuthTokenUsingUvWithPermissions` and is preceded
+/// by a read of the retry counter. Anything that would write to the
+/// authenticator, `setPIN` and `changePIN` above all, stays out of reach of the
+/// remote session.
+fn client_pin_action(subcommand: u8) -> ClientPinAction {
+    match subcommand {
+        CLIENT_PIN_GET_KEY_AGREEMENT => ClientPinAction::KeyAgreement,
+        // Both counters are read-only and disclose nothing about the PIN, and
+        // platforms read them before offering to verify. Refusing them makes
+        // the authenticator look broken and the operation is abandoned.
+        CLIENT_PIN_GET_PIN_RETRIES => ClientPinAction::PinRetries,
+        CLIENT_PIN_GET_UV_RETRIES => ClientPinAction::UvRetries,
+        // The PIN variant only arrives from clients that ignore the missing
+        // clientPin option; both are answered by the local PIN prompt.
+        CLIENT_PIN_TOKEN_USING_UV | CLIENT_PIN_TOKEN_USING_PIN => ClientPinAction::IssueToken,
+        _ => ClientPinAction::Unsupported,
     }
 }
 
@@ -1191,6 +1273,41 @@ mod tests {
             options.get(&Value::Text("pinUvAuthToken".to_owned())),
             Some(&Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn answers_the_client_pin_subcommands_the_advertisement_implies() {
+        // GetInfo hides clientPin and offers uv, so a CTAP 2.1 platform asks
+        // for a token with the built-in method rather than with a PIN.
+        assert_eq!(
+            client_pin_action(CLIENT_PIN_TOKEN_USING_UV),
+            ClientPinAction::IssueToken
+        );
+        assert_eq!(
+            client_pin_action(CLIENT_PIN_GET_UV_RETRIES),
+            ClientPinAction::UvRetries
+        );
+        assert_eq!(
+            client_pin_action(CLIENT_PIN_GET_KEY_AGREEMENT),
+            ClientPinAction::KeyAgreement
+        );
+        assert_eq!(
+            client_pin_action(CLIENT_PIN_TOKEN_USING_PIN),
+            ClientPinAction::IssueToken
+        );
+        assert_eq!(
+            client_pin_action(CLIENT_PIN_GET_PIN_RETRIES),
+            ClientPinAction::PinRetries
+        );
+        // setPIN and changePIN would let the remote session take over the
+        // authenticator, and getPinToken bypasses the permission scoping.
+        for subcommand in [0x03, 0x04, CLIENT_PIN_GET_PIN_TOKEN] {
+            assert_eq!(
+                client_pin_action(subcommand),
+                ClientPinAction::Unsupported,
+                "subcommand 0x{subcommand:02x} must stay unreachable"
+            );
+        }
     }
 
     #[test]

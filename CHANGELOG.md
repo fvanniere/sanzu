@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-08-16
+
+### Fixed
+- Relay `getPINRetries` to the authenticator instead of rejecting it. The
+  counter is read-only and discloses nothing about the PIN, and platforms read
+  it before offering to verify; refusing it makes the forwarded authenticator
+  look broken and the operation is abandoned.
+- Answer the ClientPIN subcommands the advertised built-in verification method
+  implies: `getPinUvAuthTokenUsingUvWithPermissions` for the token and
+  `getUVRetries` for the counter. Both were rejected as invalid subcommands.
+  Firefox takes the `clientPin` path instead, so it never hit this one.
+
+### Known issues
+- Logging into a Pocket ID instance from the remote Firefox still fails. See
+  the commit message of this release for the full investigation.
+
 ## [0.2.7] - 2026-08-15
 
 ### Fixed
