@@ -59,9 +59,35 @@ fn describe_cert_issuer(der: &[u8]) -> String {
     }
 }
 
+/// Prepend a der sequence header to @der
+fn der_wrap_sequence(der: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x30u8];
+    let len = der.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let len_bytes = len.to_be_bytes();
+        let start = len_bytes
+            .iter()
+            .position(|&byte| byte != 0)
+            .unwrap_or(len_bytes.len() - 1);
+        let len_bytes = &len_bytes[start..];
+        out.push(0x80 | len_bytes.len() as u8);
+        out.extend_from_slice(len_bytes);
+    }
+    out.extend_from_slice(der);
+    out
+}
+
 /// Format a der encoded distinguished name (as stored in the root cert store)
+/// The trust anchors keep the subject as the raw value of the name, ie without
+/// its sequence header: rebuild it if the name cannot be parsed as is
 fn describe_dn(der: &[u8]) -> String {
-    match x509_parser::x509::X509Name::from_der(der) {
+    if let Ok((_, name)) = x509_parser::x509::X509Name::from_der(der) {
+        return name.to_string();
+    }
+    let wrapped = der_wrap_sequence(der);
+    match x509_parser::x509::X509Name::from_der(&wrapped) {
         Ok((_, name)) => name.to_string(),
         Err(err) => format!("Unparsable name ({} bytes): {:?}", der.len(), err),
     }
@@ -316,16 +342,28 @@ impl DebugServerCertVerifier {
         match err {
             TlsError::InvalidCertificate(CertificateError::UnknownIssuer) => {
                 let last = intermediates.last().unwrap_or(end_entity);
+                let issuer = describe_cert_issuer(&last.0);
                 error!(
-                    "No trusted ca matches the issuer of the last certificate of the chain: {:?}",
-                    describe_cert_issuer(&last.0)
+                    "Issuer of the last certificate of the chain: {:?}",
+                    issuer
                 );
                 error!("Trusted ca subjects: {:?}", self.root_subjects);
-                error!(
-                    "Hint: either the ca given to the client is not the one which \
-                     signed the server certificate, or the server does not send \
-                     the intermediate certificates of its chain"
-                );
+                if self.root_subjects.contains(&issuer) {
+                    error!(
+                        "A trusted ca has the same subject as this issuer: the chain \
+                         could not be validated for another reason. Check that the ca \
+                         certificate is the one which really signed the chain, that it \
+                         has basicConstraints CA:true, that no certificate is expired, \
+                         and that the signature algorithms and key sizes are supported \
+                         (webpki rejects sha1, small rsa keys and the p521 curve)"
+                    );
+                } else {
+                    error!(
+                        "Hint: either the ca given to the client is not the one which \
+                         signed the server certificate, or the server does not send \
+                         the intermediate certificates of its chain"
+                    );
+                }
             }
             TlsError::InvalidCertificate(CertificateError::NotValidForName) => {
                 error!(
