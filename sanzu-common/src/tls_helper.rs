@@ -1,47 +1,119 @@
 pub use crate::ReadWrite;
 use anyhow::{Context, Result};
+use rustls::client::{
+    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier, WebPkiVerifier,
+};
 use rustls::ServerConnection;
 use rustls::{
     self,
     server::{AllowAnyAnonymousOrAuthenticatedClient, AllowAnyAuthenticatedClient},
-    OwnedTrustAnchor, RootCertStore,
+    Certificate, CertificateError, DigitallySignedStruct, Error as TlsError, OwnedTrustAnchor,
+    RootCertStore, ServerName, SignatureScheme,
 };
 use std::{
     fs,
     io::{BufReader, Read, Write},
     sync::Arc,
+    time::SystemTime,
 };
 use x509_parser::extensions::{GeneralName::RFC822Name, ParsedExtension, SubjectAlternativeName};
+use x509_parser::prelude::FromDer;
+
+/// Extract the subject alternative names of a parsed certificate
+fn cert_alt_names(cert: &x509_parser::certificate::X509Certificate) -> Vec<String> {
+    let mut alt_names = vec![];
+    for extension in cert.extensions().iter() {
+        if let ParsedExtension::SubjectAlternativeName(SubjectAlternativeName { general_names }) =
+            extension.parsed_extension()
+        {
+            for general_name in general_names {
+                alt_names.push(format!("{general_name:?}"));
+            }
+        }
+    }
+    alt_names
+}
+
+/// Format a der encoded certificate into a human readable summary
+fn describe_cert(der: &[u8]) -> String {
+    match x509_parser::parse_x509_certificate(der) {
+        Ok((_, cert)) => format!(
+            "subject: {:?} issuer: {:?} serial: {} not_before: {} not_after: {} is_ca: {} alt_names: {:?}",
+            cert.subject().to_string(),
+            cert.issuer().to_string(),
+            cert.raw_serial_as_string(),
+            cert.validity().not_before,
+            cert.validity().not_after,
+            cert.is_ca(),
+            cert_alt_names(&cert),
+        ),
+        Err(err) => format!("Unparsable certificate ({} bytes): {:?}", der.len(), err),
+    }
+}
+
+/// Format the issuer of a der encoded certificate
+fn describe_cert_issuer(der: &[u8]) -> String {
+    match x509_parser::parse_x509_certificate(der) {
+        Ok((_, cert)) => cert.issuer().to_string(),
+        Err(err) => format!("Unparsable certificate ({} bytes): {:?}", der.len(), err),
+    }
+}
+
+/// Format a der encoded distinguished name (as stored in the root cert store)
+fn describe_dn(der: &[u8]) -> String {
+    match x509_parser::x509::X509Name::from_der(der) {
+        Ok((_, name)) => name.to_string(),
+        Err(err) => format!("Unparsable name ({} bytes): {:?}", der.len(), err),
+    }
+}
 
 /// Load private key from @filename
 fn load_private_key(filename: &str) -> Result<rustls::PrivateKey> {
+    debug!("Loading private key from {:?}", filename);
     let keyfile = fs::File::open(filename).context("Cannot open private key file")?;
     let mut reader = BufReader::new(keyfile);
 
     loop {
         match rustls_pemfile::read_one(&mut reader).context("Cannot parse private key file")? {
-            Some(rustls_pemfile::Item::RSAKey(key)) => return Ok(rustls::PrivateKey(key)),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => return Ok(rustls::PrivateKey(key)),
+            Some(rustls_pemfile::Item::RSAKey(key)) => {
+                debug!("Found rsa private key in {:?}", filename);
+                return Ok(rustls::PrivateKey(key));
+            }
+            Some(rustls_pemfile::Item::PKCS8Key(key)) => {
+                debug!("Found pkcs8 private key in {:?}", filename);
+                return Ok(rustls::PrivateKey(key));
+            }
             None => {
                 return Err(anyhow!(
                     "No keys found in {:?} (encrypted keys not supported)",
                     filename
                 ))
             }
-            _ => {}
+            Some(item) => {
+                debug!("Skipping non key pem item in {:?}: {:?}", filename, item);
+            }
         }
     }
 }
 
 /// Load Certificates from @filename
 fn load_certs(filename: &str) -> Result<Vec<rustls::Certificate>> {
+    debug!("Loading certificates from {:?}", filename);
     let certfile = fs::File::open(filename).context("Cannot open certificate file")?;
     let mut reader = BufReader::new(certfile);
-    Ok(rustls_pemfile::certs(&mut reader)
-        .unwrap()
+    let certs: Vec<rustls::Certificate> = rustls_pemfile::certs(&mut reader)
+        .context(format!("Cannot parse certificate file {filename:?}"))?
         .iter()
         .map(|v| rustls::Certificate(v.clone()))
-        .collect())
+        .collect();
+    debug!("Loaded {} certificate(s) from {:?}", certs.len(), filename);
+    for (index, cert) in certs.iter().enumerate() {
+        debug!("  {} cert {}: {}", filename, index, describe_cert(&cert.0));
+    }
+    if certs.is_empty() {
+        warn!("No certificate found in {:?}", filename);
+    }
+    Ok(certs)
 }
 
 /// Apply tls operation to socket
@@ -63,9 +135,29 @@ pub fn tls_do_handshake<T: Read + Write>(
 ) -> Result<()> {
     while server.is_handshaking() {
         tls_transfer(server, socket).context("Error in tls_transfer")?;
-        server
-            .process_new_packets()
-            .context("Error in process_new_packets")?;
+        if let Err(err) = server.process_new_packets() {
+            error!("Tls handshake error: {:?}", err);
+            if let Some(certs) = server.peer_certificates() {
+                error!("Peer sent {} certificate(s)", certs.len());
+                for (index, cert) in certs.iter().enumerate() {
+                    error!("  peer cert {}: {}", index, describe_cert(&cert.0));
+                }
+            } else {
+                error!("Peer sent no certificate");
+            }
+            return Err(err).context("Error in process_new_packets");
+        }
+    }
+    debug!(
+        "Tls handshake done (protocol: {:?}, cipher suite: {:?})",
+        server.protocol_version(),
+        server.negotiated_cipher_suite()
+    );
+    if let Some(certs) = server.peer_certificates() {
+        debug!("Client sent {} certificate(s)", certs.len());
+        for (index, cert) in certs.iter().enumerate() {
+            debug!("  client cert {}: {}", index, describe_cert(&cert.0));
+        }
     }
     Ok(())
 }
@@ -77,12 +169,30 @@ pub fn make_server_config(
     server_key: &str,
     auth_client: bool,
 ) -> Result<Arc<rustls::ServerConfig>> {
+    debug!(
+        "Making tls server config: ca: {:?} cert: {:?} key: {:?} auth_client: {}",
+        ca_file, server_cert, server_key, auth_client
+    );
     let mut client_auth_roots = RootCertStore::empty();
     let roots = load_certs(ca_file).context("Cannot load ca certificates")?;
     for root in roots {
-        client_auth_roots.add(&root).unwrap();
+        client_auth_roots
+            .add(&root)
+            .context(format!("Cannot add ca certificate from {ca_file:?}"))?;
     }
+    debug!(
+        "Client auth root store contains {} certificate(s)",
+        client_auth_roots.roots.len()
+    );
     let certs = load_certs(server_cert).context("Cannot load server ceritifactes")?;
+    if certs.len() == 1 {
+        debug!(
+            "Only one certificate is sent to the client: if it is not directly \
+             signed by a ca trusted by the client, add the intermediate \
+             certificates to {:?}",
+            server_cert
+        );
+    }
 
     let client_auth = if auth_client {
         AllowAnyAuthenticatedClient::new(client_auth_roots).boxed()
@@ -139,20 +249,211 @@ pub fn get_subj_alt_names(cert: &x509_parser::certificate::X509Certificate) -> R
     }
 }
 
+/// Server certificate verifier which logs the certificate chain sent by the
+/// server and the reason of the verification failures.
+/// The verification itself is delegated to the standard webpki verifier, so the
+/// trust decision is left unchanged.
+struct DebugServerCertVerifier {
+    verifier: WebPkiVerifier,
+    /// Subjects of the trusted ca, kept for logging purpose
+    root_subjects: Vec<String>,
+}
+
+impl DebugServerCertVerifier {
+    fn new(roots: RootCertStore) -> Self {
+        let root_subjects = roots
+            .roots
+            .iter()
+            .map(|root| {
+                let der: &[u8] = root.subject().as_ref();
+                describe_dn(der)
+            })
+            .collect();
+        DebugServerCertVerifier {
+            verifier: WebPkiVerifier::new(roots, None),
+            root_subjects,
+        }
+    }
+
+    /// Log details on the trust chain we have been given
+    fn log_chain(
+        &self,
+        end_entity: &Certificate,
+        intermediates: &[Certificate],
+        server_name: &ServerName,
+    ) {
+        debug!("Verifying server certificate for name {:?}", server_name);
+        debug!("Server certificate: {}", describe_cert(&end_entity.0));
+        debug!(
+            "Server sent {} intermediate certificate(s)",
+            intermediates.len()
+        );
+        for (index, intermediate) in intermediates.iter().enumerate() {
+            debug!(
+                "  intermediate cert {}: {}",
+                index,
+                describe_cert(&intermediate.0)
+            );
+        }
+        debug!(
+            "Client trusts {} ca certificate(s)",
+            self.root_subjects.len()
+        );
+        for (index, subject) in self.root_subjects.iter().enumerate() {
+            debug!("  trusted ca {}: {:?}", index, subject);
+        }
+    }
+
+    /// Log some hints on the cause of a verification error
+    fn log_error(
+        &self,
+        err: &TlsError,
+        end_entity: &Certificate,
+        intermediates: &[Certificate],
+        server_name: &ServerName,
+    ) {
+        error!("Server certificate verification failed: {:?}", err);
+        match err {
+            TlsError::InvalidCertificate(CertificateError::UnknownIssuer) => {
+                let last = intermediates.last().unwrap_or(end_entity);
+                error!(
+                    "No trusted ca matches the issuer of the last certificate of the chain: {:?}",
+                    describe_cert_issuer(&last.0)
+                );
+                error!("Trusted ca subjects: {:?}", self.root_subjects);
+                error!(
+                    "Hint: either the ca given to the client is not the one which \
+                     signed the server certificate, or the server does not send \
+                     the intermediate certificates of its chain"
+                );
+            }
+            TlsError::InvalidCertificate(CertificateError::NotValidForName) => {
+                error!(
+                    "The server certificate is not valid for the requested name {:?}",
+                    server_name
+                );
+                error!(
+                    "Hint: the tls server name of the client must match the subject \
+                     alternative name of the server certificate"
+                );
+            }
+            TlsError::InvalidCertificate(CertificateError::Expired) => {
+                error!("The server certificate chain is expired or not yet valid");
+            }
+            TlsError::InvalidCertificate(CertificateError::BadEncoding) => {
+                error!("The server certificate is malformed");
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ServerCertVerifier for DebugServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &Certificate,
+        intermediates: &[Certificate],
+        server_name: &ServerName,
+        scts: &mut dyn Iterator<Item = &[u8]>,
+        ocsp_response: &[u8],
+        now: SystemTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        self.log_chain(end_entity, intermediates, server_name);
+        match self.verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            scts,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => {
+                debug!("Server certificate chain is valid");
+                Ok(verified)
+            }
+            Err(err) => {
+                self.log_error(&err, end_entity, intermediates, server_name);
+                Err(err)
+            }
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &Certificate,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.verifier
+            .verify_tls12_signature(message, cert, dss)
+            .map_err(|err| {
+                error!("Tls 1.2 signature verification failed: {:?}", err);
+                err
+            })
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &Certificate,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.verifier
+            .verify_tls13_signature(message, cert, dss)
+            .map_err(|err| {
+                error!("Tls 1.3 signature verification failed: {:?}", err);
+                err
+            })
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.verifier.supported_verify_schemes()
+    }
+
+    fn request_scts(&self) -> bool {
+        self.verifier.request_scts()
+    }
+}
+
 /// Make tls client config from config file
 pub fn make_client_config(
     ca_file: Option<&str>,
     client_cert: Option<&str>,
     client_key: Option<&str>,
 ) -> Result<Arc<rustls::ClientConfig>> {
+    debug!(
+        "Making tls client config: ca: {:?} client cert: {:?} client key: {:?}",
+        ca_file, client_cert, client_key
+    );
     let mut root_store = RootCertStore::empty();
 
     if ca_file.is_some() {
         let cafile = ca_file.as_ref().unwrap();
 
+        debug!("Loading trusted ca from {:?}", cafile);
         let certfile = fs::File::open(cafile).context("Cannot open CA file")?;
         let mut reader = BufReader::new(certfile);
-        root_store.add_parsable_certificates(&rustls_pemfile::certs(&mut reader).unwrap());
+        let ca_certs = rustls_pemfile::certs(&mut reader)
+            .context(format!("Cannot parse CA file {cafile:?}"))?;
+        debug!("Found {} certificate(s) in {:?}", ca_certs.len(), cafile);
+        for (index, ca_cert) in ca_certs.iter().enumerate() {
+            debug!("  ca cert {}: {}", index, describe_cert(ca_cert));
+        }
+        let (added, ignored) = root_store.add_parsable_certificates(&ca_certs);
+        debug!(
+            "Added {} ca certificate(s) to the trust store, ignored {}",
+            added, ignored
+        );
+        if ignored != 0 {
+            warn!("{} certificate(s) of {:?} were rejected", ignored, cafile);
+        }
+        if added == 0 {
+            warn!(
+                "No usable ca certificate in {:?}: every server certificate \
+                 will be rejected with 'UnknownCA'",
+                cafile
+            );
+        }
     } else {
         root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
             OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -161,6 +462,10 @@ pub fn make_client_config(
                 ta.name_constraints,
             )
         }));
+        debug!(
+            "No ca file given: using the {} builtin webpki roots",
+            root_store.roots.len()
+        );
     }
 
     let suites = rustls::DEFAULT_CIPHER_SUITES.to_vec();
@@ -172,7 +477,7 @@ pub fn make_client_config(
         .with_safe_default_kx_groups()
         .with_protocol_versions(&versions)
         .context("Inconsistent cipher-suite/versions selected")?
-        .with_root_certificates(root_store);
+        .with_root_certificates(root_store.clone());
 
     let mut config = match (client_cert, client_key) {
         (Some(client_cert), Some(client_key)) => {
@@ -182,13 +487,23 @@ pub fn make_client_config(
                 .with_single_cert(certs, key)
                 .context("Invalid client auth certs/key")?
         }
-        (None, None) => config.with_no_client_auth(),
+        (None, None) => {
+            debug!("No client certificate given");
+            config.with_no_client_auth()
+        }
         _ => {
             panic!("Give both client cert/key");
         }
     };
 
+    // Keep the standard trust decision, but log the certificate chain and the
+    // verification errors
+    config
+        .dangerous()
+        .set_certificate_verifier(Arc::new(DebugServerCertVerifier::new(root_store)));
+
     config.key_log = Arc::new(rustls::KeyLogFile::new());
     config.enable_sni = false;
+    debug!("Tls client config ready (sni disabled)");
     Ok(Arc::new(config))
 }

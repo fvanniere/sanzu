@@ -410,6 +410,32 @@ pub fn do_run(
     .context("Error in make client tls config")?;
     let mut conn = rustls::ClientConnection::new(config, server_name)
         .context("Error in new ClientConnection")?;
+
+    if arguments.tls_server_name.is_some() {
+        debug!(
+            "Starting tls handshake (server name: {:?}, ca: {:?}, client cert: {:?})",
+            tls_server_name_ok, arguments.tls_ca, arguments.client_cert
+        );
+        while conn.is_handshaking() {
+            match conn.complete_io(&mut socket) {
+                Ok((read, written)) => {
+                    debug!("Tls handshake io: read {} bytes, wrote {}", read, written);
+                }
+                Err(err) => {
+                    error!("Tls handshake failed: {} ({:?})", err, err.kind());
+                    return Err(err).context("Error in tls handshake");
+                }
+            }
+        }
+        debug!(
+            "Tls handshake done (protocol: {:?}, cipher suite: {:?})",
+            conn.protocol_version(),
+            conn.negotiated_cipher_suite()
+        );
+    } else {
+        debug!("No tls server name given: tls is disabled");
+    }
+
     let mut tls = rustls::Stream::new(&mut conn, &mut socket);
 
     let server: &mut dyn ReadWrite = if arguments.tls_server_name.is_some() {
