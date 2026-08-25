@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Add debug-level FIDO traffic diagnostics with directions, CTAPHID channels,
+  command and status names, payload sizes, report counts, transaction timing,
+  and PIN broker state transitions. Sensitive payload contents and relying-party
+  identifiers remain omitted.
+
 ## [0.2.8] - 2026-08-16
 
 ### Fixed

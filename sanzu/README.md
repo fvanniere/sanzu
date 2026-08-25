@@ -70,6 +70,40 @@ Mouse coordinates, resized windows, and seamless areas are scaled automatically.
 the server's adaptive-resolution mode (the default); it is incompatible with
 `--keep-server-resolution`.
 
+### Clipboard modes
+
+The client-side `--clipboard` option controls clipboard transfers from the
+client to the server:
+
+- `allow` (the default) sends each local clipboard change automatically.
+- `deny` never sends the local clipboard to the server.
+- `trig` watches local clipboard changes but only sends the latest observed
+  text when `Ctrl+Alt+Shift+C` is pressed while the Sanzu client receives
+  keyboard input.
+
+For example, start the client in trigger mode with:
+
+```
+sanzu_client 192.168.0.1 1122 --clipboard trig
+```
+
+In `trig` mode, copying text locally only updates a value held by the client;
+no clipboard data is sent over the network at that point. Pressing
+`Ctrl+Alt+Shift+C` sends that value once to the server, where it becomes
+available to remote applications. Pressing the shortcut again sends the same
+value again unless the local clipboard has changed. If no local clipboard value
+has been observed since the client started, the shortcut sends nothing.
+
+On X11, Sanzu watches both the `PRIMARY` and `CLIPBOARD` selections; on Windows,
+it watches Unicode text clipboard updates. Changes received from the server and
+written into the local clipboard are ignored by the outgoing watcher to avoid
+echo loops. The trigger shortcut itself is not consumed: its key events are
+also forwarded to the remote session.
+
+This option only gates the client-to-server direction. Server-to-client
+clipboard updates remain automatic; start the server with
+`--restrict-clipboard` to disable that direction.
+
 ### FIDO2 / YubiKey forwarding
 
 A Linux or Windows client can expose the FIDO interface of a local YubiKey (or
@@ -127,6 +161,12 @@ and clears it after the operation that tests user presence.
 Unsupported ClientPIN management commands are rejected. PIN-protected remote
 operations currently fail closed on Windows clients until an equivalent native
 secure prompt is implemented.
+
+For focused diagnostics, set `RUST_LOG=sanzu::fido=debug` on both endpoints
+(or use `-vvv` to enable all debug logs). FIDO debug output includes message
+directions, CTAPHID channels, command/status names, sizes, fragmentation,
+transaction timing and PIN broker state, but never CBOR payloads, PINs, tokens,
+keys or relying-party identifiers.
 
 On a multi-user server, pass a distinct `--fido-virtual-id` to each server
 process. The resulting sysfs `phys` value is `sanzu/fido/<ID>`, so a udev rule
