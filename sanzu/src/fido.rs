@@ -286,13 +286,14 @@ impl FidoClient {
                         "Authenticator answered {}",
                         describe_message(&message, false)
                     );
+                    trace_payload("Authenticator payload", &message.payload, false);
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
                         debug!("Rewriting the GetInfo answer for cid 0x{:08x}", message.cid);
                         advertise_local_pin_broker(&mut message.payload, self.es256_only)?;
                         info!("FIDO GetInfo response exposes the local PIN broker");
+                        trace_payload("Rewritten payload", &message.payload, false);
                     }
-                    trace_payload("Authenticator payload", &message.payload, false);
                     self.output.extend(fragment_message(&message)?);
                 }
             }
