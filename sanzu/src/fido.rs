@@ -114,10 +114,16 @@ pub struct FidoClient {
     pending_get_info: HashSet<u32>,
     proxy_secret: SecretKey,
     pin_session: Option<PinSession>,
+    /// Forward everything untouched: no GetInfo rewrite, no ClientPIN broker,
+    /// no proof translation. The remote session then talks to the raw
+    /// authenticator and prompts for the PIN itself, which is what this
+    /// forwarding did before the local broker existed. Kept as a diagnostic:
+    /// it isolates the broker from the rest of the path in one flag.
+    passthrough: bool,
 }
 
 impl FidoClient {
-    pub fn open(requested_path: Option<&str>) -> Result<Self> {
+    pub fn open(requested_path: Option<&str>, passthrough: bool) -> Result<Self> {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
@@ -224,8 +230,16 @@ impl FidoClient {
                 .set_blocking_mode(false)
                 .context("Cannot make FIDO HID device non-blocking")?;
             info!(
-                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}",
-                info.product_name, info.vendor_id, info.product_id, path
+                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}{}",
+                info.product_name,
+                info.vendor_id,
+                info.product_id,
+                path,
+                if passthrough {
+                    " in passthrough mode: the remote session asks for the PIN"
+                } else {
+                    ""
+                }
             );
             return Ok(Self {
                 device,
@@ -236,12 +250,13 @@ impl FidoClient {
                 pending_get_info: HashSet::new(),
                 proxy_secret: SecretKey::random(&mut OsRng),
                 pin_session: None,
+                passthrough,
             });
         }
 
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = requested_path;
+            let _ = (requested_path, passthrough);
             Err(anyhow!(
                 "FIDO forwarding is supported only by Linux and Windows clients"
             ))
@@ -317,6 +332,10 @@ impl FidoClient {
     #[cfg(any(target_os = "linux", windows))]
     fn handle_remote_message(&mut self, mut message: CtapMessage) -> Result<()> {
         debug!("Remote session sent {}", describe_message(&message, true));
+        if self.passthrough {
+            debug!("Passthrough mode: forwarding to the authenticator untouched");
+            return self.write_message(&message);
+        }
         if message.command != CTAPHID_CBOR || message.payload.is_empty() {
             debug!("Forwarding the message to the authenticator untouched");
             return self.write_message(&message);

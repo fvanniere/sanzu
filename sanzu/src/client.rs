@@ -548,7 +548,7 @@ pub fn do_run(
     }
     let mut fido = if fido_requested {
         Some(
-            FidoClient::open(arguments.fido_device.as_deref())
+            FidoClient::open(arguments.fido_device.as_deref(), arguments.fido_passthrough)
                 .map_err(|err| send_client_err_event(server, err))?,
         )
     } else {
@@ -617,7 +617,7 @@ pub fn do_run(
             && fido_requested
             && fido_retry_at.map_or(true, |retry_at| retry_at <= time_start)
         {
-            match FidoClient::open(arguments.fido_device.as_deref()) {
+            match FidoClient::open(arguments.fido_device.as_deref(), arguments.fido_passthrough) {
                 Ok(candidate)
                     if fido_info
                         .as_ref()

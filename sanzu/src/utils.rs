@@ -245,6 +245,12 @@ pub struct ClientArgsConfig {
         help = "FIDO device selector: HID path, text in manufacturer/product/serial, or hexadecimal VID:PID (for example 1050:0407); also enables --fido"
     )]
     pub fido_device: Option<String>,
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "Forward the FIDO authenticator verbatim: no local PIN broker, no GetInfo rewrite. The remote session sees the raw authenticator and asks for the PIN itself"
+    )]
+    pub fido_passthrough: bool,
     #[clap(long, short = 's', help = "Audio sample rate")]
     pub audio_sample_rate: Option<u32>,
     #[clap(
