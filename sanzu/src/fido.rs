@@ -19,6 +19,11 @@ use std::{
     convert::TryInto,
     io::{Read, Write},
     process::{Command, Stdio},
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -471,7 +476,10 @@ impl FidoClient {
             }
         };
         debug!("Answering the UV retry counter with {retries} attempt(s) left");
-        Ok(ctap_success(map_of([(5, Value::Integer(retries as i128))]))?)
+        Ok(ctap_success(map_of([(
+            5,
+            Value::Integer(retries as i128),
+        )]))?)
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -1626,6 +1634,264 @@ impl FidoServer {
     }
 }
 
+/// How often a device thread looks for new reports when the device is there.
+///
+/// CTAPHID clients time out on the scale of a local USB transaction. Polling
+/// the device from the session loop tied every exchange to a video frame,
+/// which is long enough for a platform to abandon the channel it just opened
+/// and restart its enumeration, allocating a new channel on the authenticator
+/// each time.
+const FIDO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How often the device thread wakes up while it has no authenticator: there
+/// is nothing to read, and reports arriving for a missing device are dropped
+/// anyway.
+const FIDO_IDLE_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to wait before looking again for an authenticator that went away.
+const FIDO_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+pub fn same_fido_device(left: &tunnel::FidoDevice, right: &tunnel::FidoDevice) -> bool {
+    left.vendor_id == right.vendor_id
+        && left.product_id == right.product_id
+        && left.product_name == right.product_name
+}
+
+/// What the device thread needs to reopen the authenticator it lost.
+pub struct FidoReopen {
+    selector: Option<String>,
+    passthrough: bool,
+    es256_only: bool,
+    expected: tunnel::FidoDevice,
+}
+
+impl FidoReopen {
+    pub fn new(
+        selector: Option<String>,
+        passthrough: bool,
+        es256_only: bool,
+        expected: tunnel::FidoDevice,
+    ) -> Self {
+        Self {
+            selector,
+            passthrough,
+            es256_only,
+            expected,
+        }
+    }
+
+    fn try_open(&self) -> Option<FidoClient> {
+        match FidoClient::open(self.selector.as_deref(), self.passthrough, self.es256_only) {
+            Ok(candidate) if same_fido_device(&candidate.info(), &self.expected) => {
+                info!("Local FIDO authenticator reconnected; forwarding resumed");
+                Some(candidate)
+            }
+            Ok(candidate) => {
+                let candidate_info = candidate.info();
+                warn!(
+                    "Ignoring a different FIDO authenticator {:?} ({:04x}:{:04x}) while waiting for the original device",
+                    candidate_info.product_name,
+                    candidate_info.vendor_id,
+                    candidate_info.product_id
+                );
+                None
+            }
+            Err(err) => {
+                debug!("Local FIDO authenticator is still unavailable: {err:#}");
+                None
+            }
+        }
+    }
+}
+
+/// Session-side handle on a FIDO device thread.
+///
+/// The session loop never touches the device: it drains the reports the thread
+/// has already read and hands over the ones that arrived from the wire. Both
+/// directions keep the per-packet report limit of the tunnel protocol, so a
+/// burst that outruns the frame rate stays queued instead of being dropped or
+/// sent in an oversized packet.
+pub struct FidoLink {
+    requests: Sender<Vec<Vec<u8>>>,
+    answers: Receiver<Vec<u8>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl FidoLink {
+    fn spawn<F>(name: &str, run: F) -> Result<Self>
+    where
+        F: FnOnce(&Receiver<Vec<Vec<u8>>>, &Sender<Vec<u8>>) -> Option<String> + Send + 'static,
+    {
+        let (request_sender, request_receiver) = mpsc::channel::<Vec<Vec<u8>>>();
+        let (answer_sender, answer_receiver) = mpsc::channel::<Vec<u8>>();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
+        thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let reason = run(&request_receiver, &answer_sender);
+                if let Ok(mut slot) = thread_failure.lock() {
+                    *slot = reason;
+                }
+            })
+            .with_context(|| format!("Cannot start the {name} thread"))?;
+        Ok(Self {
+            requests: request_sender,
+            answers: answer_receiver,
+            failure,
+        })
+    }
+
+    /// Reports the device produced since the last call, capped to what one
+    /// tunnel packet accepts. The rest stays queued for the next call.
+    pub fn poll_reports(&mut self) -> Result<Vec<Vec<u8>>> {
+        let mut reports = Vec::new();
+        while reports.len() < MAX_REPORTS_PER_CYCLE {
+            match self.answers.try_recv() {
+                Ok(report) => reports.push(report),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if reports.is_empty() {
+                        return Err(self.stopped());
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(reports)
+    }
+
+    pub fn write_reports(&mut self, reports: Vec<Vec<u8>>) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        if reports.len() > MAX_REPORTS_PER_CYCLE {
+            return Err(anyhow!("Too many FIDO HID reports in one packet"));
+        }
+        self.requests.send(reports).map_err(|_| self.stopped())
+    }
+
+    fn stopped(&self) -> anyhow::Error {
+        match self.failure.lock().ok().and_then(|slot| slot.clone()) {
+            Some(reason) => anyhow!("The FIDO device thread stopped: {reason}"),
+            None => anyhow!("The FIDO device thread stopped"),
+        }
+    }
+}
+
+impl FidoClient {
+    /// Move the authenticator to its own thread and keep only the channels.
+    ///
+    /// The thread also owns the reconnection policy and the local PIN prompt,
+    /// which spawns pinentry and waits for the user: neither belongs on the
+    /// loop that has to keep decoding video.
+    pub fn into_link(self, reopen: FidoReopen) -> Result<FidoLink> {
+        FidoLink::spawn("fido-authenticator", move |requests, answers| {
+            run_authenticator(self, reopen, requests, answers)
+        })
+    }
+}
+
+fn run_authenticator(
+    client: FidoClient,
+    reopen: FidoReopen,
+    requests: &Receiver<Vec<Vec<u8>>>,
+    answers: &Sender<Vec<u8>>,
+) -> Option<String> {
+    let mut device = Some(client);
+    let mut retry_at: Option<Instant> = None;
+    loop {
+        let wait = match device {
+            Some(_) => FIDO_POLL_INTERVAL,
+            None => FIDO_IDLE_INTERVAL,
+        };
+        match requests.recv_timeout(wait) {
+            Ok(reports) => match device.as_mut() {
+                Some(current) => {
+                    if let Err(err) = current.write_reports(reports) {
+                        warn!(
+                            "Local FIDO authenticator disconnected while writing ({err:#}); suspending FIDO forwarding without closing the video session"
+                        );
+                        device = None;
+                        retry_at = Some(Instant::now() + FIDO_REOPEN_INTERVAL);
+                    }
+                }
+                None => debug!(
+                    "Dropping {} remote FIDO report(s) while the local authenticator is unavailable",
+                    reports.len()
+                ),
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        match device.as_mut() {
+            Some(current) => match current.poll_reports() {
+                Ok(reports) => {
+                    for report in reports {
+                        if answers.send(report).is_err() {
+                            return None;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Local FIDO authenticator disconnected while reading ({err:#}); suspending FIDO forwarding without closing the video session"
+                    );
+                    device = None;
+                    retry_at = Some(Instant::now() + FIDO_REOPEN_INTERVAL);
+                }
+            },
+            None => {
+                let now = Instant::now();
+                if retry_at.map_or(true, |at| at <= now) {
+                    device = reopen.try_open();
+                    retry_at = match device {
+                        Some(_) => None,
+                        None => Some(now + FIDO_REOPEN_INTERVAL),
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl FidoServer {
+    /// Move the virtual authenticator to its own thread. A /dev/uhid error is
+    /// fatal for the session, so it is reported through the channel closing
+    /// instead of being retried.
+    pub fn into_link(self) -> Result<FidoLink> {
+        FidoLink::spawn("fido-virtual", move |requests, answers| {
+            run_virtual_device(self, requests, answers)
+        })
+    }
+}
+
+fn run_virtual_device(
+    mut device: FidoServer,
+    requests: &Receiver<Vec<Vec<u8>>>,
+    answers: &Sender<Vec<u8>>,
+) -> Option<String> {
+    loop {
+        match requests.recv_timeout(FIDO_POLL_INTERVAL) {
+            Ok(reports) => {
+                if let Err(err) = device.write_reports(reports) {
+                    return Some(format!("{err:#}"));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        match device.poll_reports() {
+            Ok(reports) => {
+                for report in reports {
+                    if answers.send(report).is_err() {
+                        return None;
+                    }
+                }
+            }
+            Err(err) => return Some(format!("{err:#}")),
+        }
+    }
+}
+
 fn virtual_fido_phys(virtual_id: Option<&str>) -> Result<String> {
     let Some(virtual_id) = virtual_id else {
         return Ok("sanzu/fido0".to_owned());
@@ -1657,6 +1923,20 @@ fn validate_report(report: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fido_reconnect_requires_the_same_device_identity() {
+        let yubikey = tunnel::FidoDevice {
+            vendor_id: 0x1050,
+            product_id: 0x0407,
+            product_name: "YubiKey OTP+FIDO+CCID".to_owned(),
+        };
+        assert!(same_fido_device(&yubikey, &yubikey));
+
+        let mut other = yubikey.clone();
+        other.product_id = 0x0406;
+        assert!(!same_fido_device(&yubikey, &other));
+    }
 
     #[test]
     fn accepts_only_complete_ctaphid_reports() {
