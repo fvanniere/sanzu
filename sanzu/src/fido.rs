@@ -1303,6 +1303,13 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     options.remove(&Value::Text("clientPin".to_owned()));
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
+    // forcePINChange and minPINLength describe the Client PIN feature. Leaving
+    // them in place while `clientPin` is hidden makes the answer contradict
+    // itself: the authenticator would be stating a PIN policy for a PIN it
+    // claims not to support. Platforms that validate GetInfo for internal
+    // consistency drop such an authenticator without sending anything else.
+    info.remove(&Value::Integer(12));
+    info.remove(&Value::Integer(13));
     debug!(
         "GetInfo forwarded to the remote session: {}",
         describe_get_info(&info)
@@ -1640,6 +1647,8 @@ mod tests {
         let mut payload = ctap_success(map_of([
             (1, Value::Array(vec![Value::Text("FIDO_2_0".to_owned())])),
             (4, Value::Map(options)),
+            (12, Value::Bool(false)),
+            (13, Value::Integer(4)),
         ]))
         .unwrap();
         advertise_local_pin_broker(&mut payload).unwrap();
@@ -1661,6 +1670,9 @@ mod tests {
             options.get(&Value::Text("pinUvAuthToken".to_owned())),
             Some(&Value::Bool(true))
         );
+        // The Client PIN policy must not outlive the Client PIN option.
+        assert_eq!(info.get(&Value::Integer(12)), None);
+        assert_eq!(info.get(&Value::Integer(13)), None);
     }
 
     #[test]
