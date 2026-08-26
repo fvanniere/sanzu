@@ -251,6 +251,12 @@ pub struct ClientArgsConfig {
         help = "Forward the FIDO authenticator verbatim: no local PIN broker, no GetInfo rewrite. The remote session sees the raw authenticator and asks for the PIN itself"
     )]
     pub fido_passthrough: bool,
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "Advertise only ES256 in the forwarded GetInfo. Diagnostic for platforms whose CBOR parser rejects the authenticator's other algorithm identifiers"
+    )]
+    pub fido_es256_only: bool,
     #[clap(long, short = 's', help = "Audio sample rate")]
     pub audio_sample_rate: Option<u32>,
     #[clap(

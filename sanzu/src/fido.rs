@@ -120,10 +120,14 @@ pub struct FidoClient {
     /// forwarding did before the local broker existed. Kept as a diagnostic:
     /// it isolates the broker from the rest of the path in one flag.
     passthrough: bool,
+    /// Trim the advertised algorithm list down to ES256. Some platform CBOR
+    /// parsers reject a GetInfo whose algorithm identifiers they do not all
+    /// recognize, and refuse the authenticator before sending any command.
+    es256_only: bool,
 }
 
 impl FidoClient {
-    pub fn open(requested_path: Option<&str>, passthrough: bool) -> Result<Self> {
+    pub fn open(requested_path: Option<&str>, passthrough: bool, es256_only: bool) -> Result<Self> {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
@@ -251,12 +255,13 @@ impl FidoClient {
                 proxy_secret: SecretKey::random(&mut OsRng),
                 pin_session: None,
                 passthrough,
+                es256_only,
             });
         }
 
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = (requested_path, passthrough);
+            let _ = (requested_path, passthrough, es256_only);
             Err(anyhow!(
                 "FIDO forwarding is supported only by Linux and Windows clients"
             ))
@@ -284,7 +289,7 @@ impl FidoClient {
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
                         debug!("Rewriting the GetInfo answer for cid 0x{:08x}", message.cid);
-                        advertise_local_pin_broker(&mut message.payload)?;
+                        advertise_local_pin_broker(&mut message.payload, self.es256_only)?;
                         info!("FIDO GetInfo response exposes the local PIN broker");
                     }
                     trace_payload("Authenticator payload", &message.payload, false);
@@ -1324,7 +1329,30 @@ fn describe_get_info(info: &BTreeMap<Value, Value>) -> String {
     )
 }
 
-fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
+/// Keep only ES256 among the advertised credential algorithms, leaving the
+/// list untouched if ES256 is not among them -- an empty algorithm list would
+/// be worse than an unparsed one.
+fn restrict_to_es256(info: &mut BTreeMap<Value, Value>) {
+    let Some(Value::Array(algorithms)) = info.get_mut(&Value::Integer(10)) else {
+        return;
+    };
+    let is_es256 = |entry: &Value| match entry {
+        Value::Map(entry) => entry.get(&Value::Text("alg".to_owned())) == Some(&Value::Integer(-7)),
+        _ => false,
+    };
+    if !algorithms.iter().any(is_es256) {
+        debug!("The authenticator does not advertise ES256; leaving the algorithms untouched");
+        return;
+    }
+    let before = algorithms.len();
+    algorithms.retain(is_es256);
+    debug!(
+        "Advertised algorithms restricted to ES256: {before} entries down to {}",
+        algorithms.len()
+    );
+}
+
+fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
     }
@@ -1366,6 +1394,9 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     // consistency drop such an authenticator without sending anything else.
     info.remove(&Value::Integer(12));
     info.remove(&Value::Integer(13));
+    if es256_only {
+        restrict_to_es256(&mut info);
+    }
     debug!(
         "GetInfo forwarded to the remote session: {}",
         describe_get_info(&info)
@@ -1707,7 +1738,7 @@ mod tests {
             (13, Value::Integer(4)),
         ]))
         .unwrap();
-        advertise_local_pin_broker(&mut payload).unwrap();
+        advertise_local_pin_broker(&mut payload, false).unwrap();
         let info = successful_map(&payload, "test").unwrap();
         let Value::Array(versions) = map_value(&info, 1).unwrap() else {
             panic!("versions should be an array");
@@ -1729,6 +1760,37 @@ mod tests {
         // The Client PIN policy must not outlive the Client PIN option.
         assert_eq!(info.get(&Value::Integer(12)), None);
         assert_eq!(info.get(&Value::Integer(13)), None);
+    }
+
+    #[test]
+    fn keeps_only_es256_when_asked_and_never_empties_the_list() {
+        let es256 = Value::Map(BTreeMap::from([
+            (Value::Text("alg".to_owned()), Value::Integer(-7)),
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("public-key".to_owned()),
+            ),
+        ]));
+        let eddsa = Value::Map(BTreeMap::from([
+            (Value::Text("alg".to_owned()), Value::Integer(-8)),
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("public-key".to_owned()),
+            ),
+        ]));
+
+        let mut info = map_of([(10, Value::Array(vec![es256.clone(), eddsa.clone()]))]);
+        restrict_to_es256(&mut info);
+        assert_eq!(
+            map_value(&info, 10).unwrap(),
+            &Value::Array(vec![es256.clone()])
+        );
+
+        // An authenticator without ES256 keeps everything: an empty algorithm
+        // list would be worse than an unrecognized one.
+        let mut info = map_of([(10, Value::Array(vec![eddsa.clone()]))]);
+        restrict_to_es256(&mut info);
+        assert_eq!(map_value(&info, 10).unwrap(), &Value::Array(vec![eddsa]));
     }
 
     #[test]
