@@ -351,9 +351,10 @@ impl FidoClient {
                         ctap_error(CTAP2_ERR_OPERATION_DENIED)
                     }
                 };
+                let status = response.first().copied().unwrap_or(0xff);
                 debug!(
-                    "Local PIN broker answers with CTAP status 0x{:02x} ({} byte(s))",
-                    response.first().copied().unwrap_or(0xff),
+                    "Local PIN broker answers with CTAP status 0x{status:02x} ({}), {} byte(s)",
+                    ctap_status_name(status),
                     response.len()
                 );
                 self.queue_cbor_response(message.cid, response)
@@ -633,9 +634,10 @@ impl FidoClient {
             };
             if let Some(message) = self.responses.push(&report)? {
                 if message.cid == cid && message.command == CTAPHID_CBOR {
+                    let status = message.payload.first().copied().unwrap_or(0xff);
                     debug!(
-                        "Authenticator answered the broker with CTAP status 0x{:02x} in {} ms",
-                        message.payload.first().copied().unwrap_or(0xff),
+                        "Authenticator answered the broker with CTAP status 0x{status:02x} ({}) in {} ms",
+                        ctap_status_name(status),
                         started_at.elapsed().as_millis()
                     );
                     trace_payload("Broker answer", &message.payload, sensitive);
@@ -871,6 +873,60 @@ fn ctap_command_name(command: u8) -> &'static str {
     }
 }
 
+/// The CTAP status codes a forwarded session realistically runs into. An
+/// authenticator refusing a command it does not implement answers
+/// CTAP1_ERR_INVALID_COMMAND, which is the signature of a platform using a
+/// feature the physical key does not have.
+#[cfg(any(target_os = "linux", windows))]
+fn ctap_status_name(status: u8) -> &'static str {
+    match status {
+        CTAP2_OK => "OK",
+        0x01 => "CTAP1_ERR_INVALID_COMMAND",
+        0x02 => "CTAP1_ERR_INVALID_PARAMETER",
+        0x03 => "CTAP1_ERR_INVALID_LENGTH",
+        0x04 => "CTAP1_ERR_INVALID_SEQ",
+        0x05 => "CTAP1_ERR_TIMEOUT",
+        0x06 => "CTAP1_ERR_CHANNEL_BUSY",
+        0x0a => "CTAP1_ERR_LOCK_REQUIRED",
+        0x0b => "CTAP1_ERR_INVALID_CHANNEL",
+        0x11 => "CTAP2_ERR_CBOR_UNEXPECTED_TYPE",
+        0x12 => "CTAP2_ERR_INVALID_CBOR",
+        0x14 => "CTAP2_ERR_MISSING_PARAMETER",
+        0x15 => "CTAP2_ERR_LIMIT_EXCEEDED",
+        0x19 => "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+        0x21 => "CTAP2_ERR_PROCESSING",
+        0x22 => "CTAP2_ERR_INVALID_CREDENTIAL",
+        0x23 => "CTAP2_ERR_USER_ACTION_PENDING",
+        0x24 => "CTAP2_ERR_OPERATION_PENDING",
+        0x25 => "CTAP2_ERR_NO_OPERATIONS",
+        0x26 => "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
+        CTAP2_ERR_OPERATION_DENIED => "CTAP2_ERR_OPERATION_DENIED",
+        0x28 => "CTAP2_ERR_KEY_STORE_FULL",
+        0x2b => "CTAP2_ERR_UNSUPPORTED_OPTION",
+        0x2c => "CTAP2_ERR_INVALID_OPTION",
+        0x2d => "CTAP2_ERR_KEEPALIVE_CANCEL",
+        0x2e => "CTAP2_ERR_NO_CREDENTIALS",
+        0x2f => "CTAP2_ERR_USER_ACTION_TIMEOUT",
+        0x30 => "CTAP2_ERR_NOT_ALLOWED",
+        CTAP2_ERR_PIN_INVALID => "CTAP2_ERR_PIN_INVALID",
+        0x32 => "CTAP2_ERR_PIN_BLOCKED",
+        CTAP2_ERR_PIN_AUTH_INVALID => "CTAP2_ERR_PIN_AUTH_INVALID",
+        0x34 => "CTAP2_ERR_PIN_AUTH_BLOCKED",
+        0x35 => "CTAP2_ERR_PIN_NOT_SET",
+        0x36 => "CTAP2_ERR_PUAT_REQUIRED",
+        0x37 => "CTAP2_ERR_PIN_POLICY_VIOLATION",
+        0x39 => "CTAP2_ERR_REQUEST_TOO_LARGE",
+        0x3a => "CTAP2_ERR_ACTION_TIMEOUT",
+        0x3b => "CTAP2_ERR_UP_REQUIRED",
+        0x3c => "CTAP2_ERR_UV_BLOCKED",
+        0x3d => "CTAP2_ERR_INTEGRITY_FAILURE",
+        CTAP2_ERR_INVALID_SUBCOMMAND => "CTAP2_ERR_INVALID_SUBCOMMAND",
+        0x3f => "CTAP2_ERR_UNAUTHORIZED_PERMISSION",
+        0x7f => "CTAP1_ERR_OTHER",
+        _ => "unknown",
+    }
+}
+
 #[cfg(any(target_os = "linux", windows))]
 fn client_pin_subcommand_name(subcommand: u8) -> &'static str {
     match subcommand {
@@ -903,7 +959,10 @@ fn describe_message(message: &CtapMessage, is_request: bool) -> String {
                 ", {} (0x{command:02x})",
                 ctap_command_name(command)
             )),
-            (false, Some(&status)) => description.push_str(&format!(", status 0x{status:02x}")),
+            (false, Some(&status)) => description.push_str(&format!(
+                ", status 0x{status:02x} ({})",
+                ctap_status_name(status)
+            )),
             (_, None) => {}
         }
     }
@@ -932,7 +991,10 @@ fn describe_report(report: &[u8], is_request: bool) -> String {
         if is_request {
             description.push_str(&format!(", {} (0x{first:02x})", ctap_command_name(first)));
         } else {
-            description.push_str(&format!(", status 0x{first:02x}"));
+            description.push_str(&format!(
+                ", status 0x{first:02x} ({})",
+                ctap_status_name(first)
+            ));
         }
     }
     description
@@ -1191,11 +1253,30 @@ fn get_assertion_tests_presence(map: &BTreeMap<Value, Value>) -> Result<bool> {
     }
 }
 
+/// The GetInfo fields a platform bases its decision on. None of them is a
+/// secret: they describe what the authenticator can do, not what it holds.
+fn describe_get_info(info: &BTreeMap<Value, Value>) -> String {
+    format!(
+        "versions {:?}, extensions {:?}, options {:?}, maxMsgSize {:?}, pinUvAuthProtocols {:?}, transports {:?}, algorithms {:?}",
+        info.get(&Value::Integer(1)),
+        info.get(&Value::Integer(2)),
+        info.get(&Value::Integer(4)),
+        info.get(&Value::Integer(5)),
+        info.get(&Value::Integer(6)),
+        info.get(&Value::Integer(9)),
+        info.get(&Value::Integer(10)),
+    )
+}
+
 fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
     }
     let mut info = decode_map(&payload[1..])?;
+    debug!(
+        "GetInfo from the authenticator: {}",
+        describe_get_info(&info)
+    );
     let versions = info
         .entry(Value::Integer(1))
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -1223,8 +1304,8 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
     debug!(
-        "GetInfo rewritten: versions {:?}, uv=true, pinUvAuthToken=true, clientPin removed, pinUvAuthProtocols=[1]",
-        info.get(&Value::Integer(1))
+        "GetInfo forwarded to the remote session: {}",
+        describe_get_info(&info)
     );
     payload.truncate(1);
     payload.extend(serde_cbor::to_vec(&Value::Map(info))?);
@@ -1258,9 +1339,20 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
             .context("Cannot open pinentry output")?
             .read_to_string(&mut stdout)?;
         let status = child.wait().context("Cannot wait for pinentry")?;
-        // `stdout` carries the PIN on its `D ` line: only the exit status and
-        // the presence of that line are ever logged, never the buffer itself.
+        // `stdout` carries the PIN on its `D ` line: only the exit status, the
+        // Assuan status lines and the presence of that line are ever logged,
+        // never the buffer itself.
         debug!("{program} exited with {status}");
+        for line in stdout.lines() {
+            if let Some(assuan) = line
+                .strip_prefix("ERR ")
+                .or_else(|| line.strip_prefix("S ERROR "))
+            {
+                // pinentry reports a missing terminal or display here, and then
+                // still exits successfully, so this is the only trace of it.
+                debug!("{program} reported an Assuan error: {assuan}");
+            }
+        }
         if !status.success() {
             return Err(anyhow!("The local PIN prompt was cancelled"));
         }
