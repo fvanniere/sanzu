@@ -28,6 +28,7 @@ const MAX_REPORTS_PER_CYCLE: usize = 64;
 const FIDO_USAGE_PAGE: u16 = 0xf1d0;
 const FIDO_USAGE: u16 = 0x0001;
 const CTAPHID_CBOR: u8 = 0x10;
+const CTAPHID_INIT: u8 = 0x06;
 const CTAP_GET_INFO: u8 = 0x04;
 const CTAP_CLIENT_PIN: u8 = 0x06;
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
@@ -843,9 +844,9 @@ fn write_hid_report(device: &hidapi::HidDevice, report: &[u8]) -> Result<()> {
 fn ctaphid_command_name(command: u8) -> &'static str {
     match command {
         0x03 => "MSG",
-        0x06 => "INIT",
         0x08 => "WINK",
         0x0c => "LOCK",
+        CTAPHID_INIT => "INIT",
         CTAPHID_CBOR => "CBOR",
         0x11 => "KEEPALIVE",
         0x3b => "PING",
@@ -942,6 +943,32 @@ fn client_pin_subcommand_name(subcommand: u8) -> &'static str {
     }
 }
 
+/// CTAPHID_INIT carries the platform's 8-byte nonce, echoed by the
+/// authenticator along with the channel it allocates. A platform that keeps
+/// re-issuing INIT without moving on to CBOR is rejecting these answers, and
+/// a nonce that does not come back unchanged is the usual reason -- so the
+/// nonce and the allocated channel are the two things worth printing. Neither
+/// is a secret: both travel in clear on the USB wire.
+#[cfg(any(target_os = "linux", windows))]
+fn describe_init(payload: &[u8], is_request: bool) -> Option<String> {
+    if is_request && payload.len() == 8 {
+        return Some(format!("nonce {}", hex(payload)));
+    }
+    if !is_request && payload.len() >= 17 {
+        return Some(format!(
+            "nonce {}, allocated cid 0x{:08x}, CTAPHID {}, device {}.{}.{}, caps 0x{:02x}",
+            hex(&payload[..8]),
+            u32::from_be_bytes(payload[8..12].try_into().unwrap()),
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+            payload[16]
+        ));
+    }
+    None
+}
+
 /// One-line summary of an assembled CTAPHID message. `is_request` tells apart a
 /// CBOR command byte from a CBOR status byte, which share the first payload
 /// position in the two directions.
@@ -964,6 +991,10 @@ fn describe_message(message: &CtapMessage, is_request: bool) -> String {
                 ctap_status_name(status)
             )),
             (_, None) => {}
+        }
+    } else if message.command == CTAPHID_INIT {
+        if let Some(init) = describe_init(&message.payload, is_request) {
+            description.push_str(&format!(", {init}"));
         }
     }
     description
@@ -995,6 +1026,12 @@ fn describe_report(report: &[u8], is_request: bool) -> String {
                 ", status 0x{first:02x} ({})",
                 ctap_status_name(first)
             ));
+        }
+    } else if command == CTAPHID_INIT {
+        // An INIT payload never spans more than this first report.
+        let length = (length as usize).min(FIDO_REPORT_SIZE - 7);
+        if let Some(init) = describe_init(&report[7..7 + length], is_request) {
+            description.push_str(&format!(", {init}"));
         }
     }
     description
