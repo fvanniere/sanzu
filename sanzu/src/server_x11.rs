@@ -39,6 +39,15 @@ use utils_x11::{get_clipboard_events, listen_clipboard};
 use x11_clipboard::Clipboard;
 
 const PATH_PCI_DEVICES: &str = "/sys/bus/pci/devices/";
+const CAPTURE_SHM_PERMISSIONS: libc::c_int = 0o600;
+
+#[cfg(test)]
+mod shm_security_tests {
+    #[test]
+    fn capture_is_readable_and_writable_only_by_its_owner() {
+        assert_eq!(super::CAPTURE_SHM_PERMISSIONS, 0o600);
+    }
+}
 
 use x11rb::{
     connection::{Connection, RequestConnection},
@@ -186,7 +195,13 @@ fn init_grab<C: Connection>(
 
     // Video is exported via tcp / vsock
     let shmid = unsafe {
-        let ret = shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT | 0o777);
+        // Xvfb and the encoder run as the same user. IPC_PRIVATE allocates a
+        // new segment; it does not prevent other UIDs from attaching to it.
+        let ret = shmget(
+            libc::IPC_PRIVATE,
+            size,
+            libc::IPC_CREAT | CAPTURE_SHM_PERMISSIONS,
+        );
         if ret < 0 {
             return Err(anyhow!("Error in shmget"));
         }
