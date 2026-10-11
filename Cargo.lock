@@ -2656,7 +2656,7 @@ checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
  "log",
  "ring 0.17.3",
- "rustls-webpki 0.101.7",
+ "rustls-webpki",
  "sct",
 ]
 
@@ -2667,16 +2667,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d194b56d58803a43635bdc398cd17e383d6f71f9182b9a192c127ca42494a59b"
 dependencies = [
  "base64",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.100.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6207cd5ed3d8dca7816f8f3725513a34609c0c765bf652b8c3cb4cfd87db46b"
-dependencies = [
- "ring 0.16.20",
- "untrusted 0.7.1",
 ]
 
 [[package]]
@@ -2712,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aes",
  "anyhow",
@@ -2762,7 +2752,6 @@ dependencies = [
  "twelf",
  "uhid-virt",
  "vsock",
- "webpki-roots",
  "winapi",
  "winres",
  "x11-clipboard",
@@ -2773,7 +2762,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu-common"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bindgen 0.69.5",
@@ -2793,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu_broker"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "bindgen 0.65.1",
@@ -3536,12 +3525,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "0.23.1"
+version = "0.25.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b03058f88386e5ff5310d9111d53f48b17d732b401aeb83a8d5190f2ac459338"
-dependencies = [
- "rustls-webpki 0.100.1",
-]
+checksum = "5f20c57d8d7db6d3b86154206ae5d8fba62dd39573114de97c2cb0578251f8e1"
 
 [[package]]
 name = "weezl"

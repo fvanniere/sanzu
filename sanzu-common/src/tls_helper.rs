@@ -493,7 +493,7 @@ pub fn make_client_config(
             );
         }
     } else {
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
                 ta.spki,
@@ -544,4 +544,67 @@ pub fn make_client_config(
     config.enable_sni = false;
     debug!("Tls client config ready (sni disabled)");
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // Real chain from a deployment: root CA and server certificate. The root
+    // and the intermediate carry critical name constraints (DNS, IP and
+    // rfc822). rustls-webpki 0.100 rejected this chain with `UnknownIssuer`;
+    // 0.101, pulled by rustls 0.21.12, accepts it.
+    const LAB_ROOT: &[u8] = include_bytes!("testdata/lab-root-g2.pem");
+    const SURF_CHAIN: &[u8] = include_bytes!("testdata/surf-chain-g2.pem");
+
+    /// 2026-09-21, within the validity of the server certificate
+    /// (2026-09-13 to 2026-12-12): the test does not depend on today's date.
+    fn during_validity() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+    }
+
+    fn certs(pem: &[u8]) -> Vec<Vec<u8>> {
+        rustls_pemfile::certs(&mut &pem[..]).unwrap()
+    }
+
+    fn lab_verifier() -> DebugServerCertVerifier {
+        let mut roots = RootCertStore::empty();
+        let (added, ignored) = roots.add_parsable_certificates(&certs(LAB_ROOT));
+        assert_eq!((added, ignored), (1, 0));
+        DebugServerCertVerifier::new(roots)
+    }
+
+    fn verify(name: &str) -> Result<ServerCertVerified, TlsError> {
+        let chain: Vec<Certificate> = certs(SURF_CHAIN).into_iter().map(Certificate).collect();
+        lab_verifier().verify_server_cert(
+            &chain[0],
+            &chain[1..],
+            &ServerName::try_from(name).unwrap(),
+            &mut std::iter::empty(),
+            &[],
+            during_validity(),
+        )
+    }
+
+    #[test]
+    fn accepts_a_chain_under_a_name_constrained_root() {
+        verify("surf.fred.lab").expect("a chain under a name constrained root must be accepted");
+    }
+
+    #[test]
+    fn still_checks_the_server_name() {
+        assert!(matches!(
+            verify("surf.example.com"),
+            Err(TlsError::InvalidCertificate(
+                CertificateError::NotValidForName
+            ))
+        ));
+    }
+
+    #[test]
+    fn builds_a_client_config_from_the_builtin_roots() {
+        make_client_config(None, None, None).expect("client config from the builtin webpki roots");
+    }
 }

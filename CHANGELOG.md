@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-11
+
+### Fixed
+- Accept certificate chains whose CA carries name constraints. The 0.2.8
+  packages embedded rustls 0.21.0 and rustls-webpki 0.100.1, which reject such
+  chains with a bare `UnknownIssuer`, so the client could not connect to a
+  broker certified by a name constrained CA. rustls 0.21.12, already in the
+  lock file since the RUSTSEC-2024-0336 update, verifies with rustls-webpki
+  0.101; this release ships it, with a regression test on a real chain.
+
+### Changed
+- Update webpki-roots to 0.25, which no longer pulls rustls-webpki 0.100: a
+  single webpki version is left in the dependency graph. Drop the unused
+  webpki-roots dependency of the `sanzu` crate.
+
+### Known issues
+- rustls-webpki, in every version, rejects a client certificate carrying an
+  rfc822Name (email) subject alternative name when the issuing CA constrains
+  that name type: it does not implement rfc822Name constraints. The broker
+  then refuses the client with `NameConstraintViolation`. The CA must not
+  constrain rfc822Name, or the client identity must use another name type.
+
 ## [0.2.8] - 2026-08-16
 
 ### Fixed
