@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.2.9] - 2026-10-11
+## [0.2.10] - 2026-10-11
 
 ### Security
 - Remove `--fido-passthrough`. It forwarded the authenticator untouched and
@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `getPinUvAuthTokenUsingPinWithPermissions`; the code had them swapped. Both
   reach the same local prompt, so behaviour is unchanged; names and logs were
   wrong. A test now checks the specification values written as literals.
+
+## [0.2.9] - 2026-10-11
+
+### Fixed
 - Accept certificate chains whose CA carries name constraints. The 0.2.8
   packages embedded rustls 0.21.0 and rustls-webpki 0.100.1, which reject such
   chains with a bare `UnknownIssuer`, so the client could not connect to a
