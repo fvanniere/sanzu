@@ -9,7 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.9] - 2026-10-11
 
+### Security
+- Remove `--fido-passthrough`. It forwarded the authenticator untouched and
+  let the remote session prompt for the PIN, the very exposure the local PIN
+  broker exists to prevent; no released build may offer it.
+- Keep the PIN out of freed memory: the pinentry output, which carries it, is
+  now wiped on drop and read into a buffer that is never reallocated, and the
+  decoded PIN is moved, not copied, into its wiped string.
+- Log CTAP payload sizes only. Trace level used to dump them in hexadecimal,
+  with the relying party, the user name and display name of new credentials
+  and credential identifiers; the relying party is also gone from the debug
+  log of a token request.
+
 ### Fixed
+- Name the ClientPIN subcommands as CTAP 2.1 does: 0x06 is
+  `getPinUvAuthTokenUsingUvWithPermissions` and 0x09
+  `getPinUvAuthTokenUsingPinWithPermissions`; the code had them swapped. Both
+  reach the same local prompt, so behaviour is unchanged; names and logs were
+  wrong. A test now checks the specification values written as literals.
 - Accept certificate chains whose CA carries name constraints. The 0.2.8
   packages embedded rustls 0.21.0 and rustls-webpki 0.100.1, which reject such
   chains with a bare `UnknownIssuer`, so the client could not connect to a

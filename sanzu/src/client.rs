@@ -535,12 +535,8 @@ pub fn do_run(
     }
     let mut fido = if fido_requested {
         Some(
-            FidoClient::open(
-                arguments.fido_device.as_deref(),
-                arguments.fido_passthrough,
-                arguments.fido_es256_only,
-            )
-            .map_err(|err| send_client_err_event(server, err))?,
+            FidoClient::open(arguments.fido_device.as_deref(), arguments.fido_es256_only)
+                .map_err(|err| send_client_err_event(server, err))?,
         )
     } else {
         None
@@ -551,7 +547,6 @@ pub fn do_run(
             client
                 .into_link(FidoReopen::new(
                     arguments.fido_device.clone(),
-                    arguments.fido_passthrough,
                     arguments.fido_es256_only,
                     info,
                 ))

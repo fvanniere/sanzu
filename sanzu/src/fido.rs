@@ -41,9 +41,13 @@ const CTAP_GET_ASSERTION: u8 = 0x02;
 const CLIENT_PIN_GET_PIN_RETRIES: u8 = 0x01;
 const CLIENT_PIN_GET_KEY_AGREEMENT: u8 = 0x02;
 const CLIENT_PIN_GET_PIN_TOKEN: u8 = 0x05;
-const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x06;
+// CTAP 2.1, authenticatorClientPIN: 0x06 is getPinUvAuthTokenUsingUvWithPermissions
+// and 0x09 getPinUvAuthTokenUsingPinWithPermissions. Both used to be named the
+// other way round; they reach the same local prompt, so only names and logs
+// were wrong.
+const CLIENT_PIN_TOKEN_USING_UV: u8 = 0x06;
 const CLIENT_PIN_GET_UV_RETRIES: u8 = 0x07;
-const CLIENT_PIN_TOKEN_USING_UV: u8 = 0x09;
+const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x09;
 // Reported when the authenticator refuses to disclose its own counter; the
 // value only sizes the remaining attempts a platform is willing to offer.
 const DEFAULT_UV_RETRIES: u8 = 8;
@@ -56,6 +60,10 @@ const PIN_PERMISSION_MAKE_CREDENTIAL: u8 = 0x01;
 const PIN_PERMISSION_GET_ASSERTION: u8 = 0x02;
 const PIN_TOKEN_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_CTAPHID_PAYLOAD: usize = 4096;
+/// Upper bound of what pinentry writes back: a few Assuan status lines and the
+/// `D ` line. A PIN is at most 63 bytes, 189 once percent-escaped.
+#[cfg(target_os = "linux")]
+const PINENTRY_OUTPUT_LIMIT: usize = 4096;
 
 #[derive(Debug, PartialEq)]
 enum FidoSelector<'a> {
@@ -119,12 +127,6 @@ pub struct FidoClient {
     pending_get_info: HashSet<u32>,
     proxy_secret: SecretKey,
     pin_session: Option<PinSession>,
-    /// Forward everything untouched: no GetInfo rewrite, no ClientPIN broker,
-    /// no proof translation. The remote session then talks to the raw
-    /// authenticator and prompts for the PIN itself, which is what this
-    /// forwarding did before the local broker existed. Kept as a diagnostic:
-    /// it isolates the broker from the rest of the path in one flag.
-    passthrough: bool,
     /// Trim the advertised algorithm list down to ES256. Some platform CBOR
     /// parsers reject a GetInfo whose algorithm identifiers they do not all
     /// recognize, and refuse the authenticator before sending any command.
@@ -132,7 +134,7 @@ pub struct FidoClient {
 }
 
 impl FidoClient {
-    pub fn open(requested_path: Option<&str>, passthrough: bool, es256_only: bool) -> Result<Self> {
+    pub fn open(requested_path: Option<&str>, es256_only: bool) -> Result<Self> {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
@@ -239,16 +241,8 @@ impl FidoClient {
                 .set_blocking_mode(false)
                 .context("Cannot make FIDO HID device non-blocking")?;
             info!(
-                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}{}",
-                info.product_name,
-                info.vendor_id,
-                info.product_id,
-                path,
-                if passthrough {
-                    " in passthrough mode: the remote session asks for the PIN"
-                } else {
-                    ""
-                }
+                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}",
+                info.product_name, info.vendor_id, info.product_id, path,
             );
             return Ok(Self {
                 device,
@@ -259,14 +253,13 @@ impl FidoClient {
                 pending_get_info: HashSet::new(),
                 proxy_secret: SecretKey::random(&mut OsRng),
                 pin_session: None,
-                passthrough,
                 es256_only,
             });
         }
 
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = (requested_path, passthrough, es256_only);
+            let _ = (requested_path, es256_only);
             Err(anyhow!(
                 "FIDO forwarding is supported only by Linux and Windows clients"
             ))
@@ -291,13 +284,13 @@ impl FidoClient {
                         "Authenticator answered {}",
                         describe_message(&message, false)
                     );
-                    trace_payload("Authenticator payload", &message.payload, false);
+                    trace_payload("Authenticator payload", &message.payload);
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
                         debug!("Rewriting the GetInfo answer for cid 0x{:08x}", message.cid);
                         advertise_local_pin_broker(&mut message.payload, self.es256_only)?;
                         info!("FIDO GetInfo response exposes the local PIN broker");
-                        trace_payload("Rewritten payload", &message.payload, false);
+                        trace_payload("Rewritten payload", &message.payload);
                     }
                     self.output.extend(fragment_message(&message)?);
                 }
@@ -343,10 +336,6 @@ impl FidoClient {
     #[cfg(any(target_os = "linux", windows))]
     fn handle_remote_message(&mut self, mut message: CtapMessage) -> Result<()> {
         debug!("Remote session sent {}", describe_message(&message, true));
-        if self.passthrough {
-            debug!("Passthrough mode: forwarding to the authenticator untouched");
-            return self.write_message(&message);
-        }
         if message.command != CTAPHID_CBOR || message.payload.is_empty() {
             debug!("Forwarding the message to the authenticator untouched");
             return self.write_message(&message);
@@ -502,7 +491,8 @@ impl FidoClient {
             return Err(anyhow!("Unsupported ClientPIN permission set"));
         }
         let rp_id = map_text(request, 10)?.to_owned();
-        debug!("Remote session asks for a token on {rp_id:?} with permissions 0x{permissions:02x}");
+        // The RP identifies the site being signed into: it stays out of the log.
+        debug!("Remote session asks for a token with permissions 0x{permissions:02x}");
         let remote_key = parse_cose_public(map_value(request, 3)?)?;
         let remote_secret = shared_secret(&self.proxy_secret, &remote_key);
 
@@ -643,7 +633,6 @@ impl FidoClient {
 
     #[cfg(any(target_os = "linux", windows))]
     fn physical_transact(&mut self, cid: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
-        let sensitive = payload.first() == Some(&CTAP_CLIENT_PIN);
         if let Some(subcommand) = payload
             .get(1..)
             .and_then(|cbor| decode_map(cbor).ok())
@@ -654,7 +643,7 @@ impl FidoClient {
                 client_pin_subcommand_name(subcommand)
             );
         }
-        trace_payload("Broker request", &payload, sensitive);
+        trace_payload("Broker request", &payload);
         let started_at = Instant::now();
         self.write_message(&CtapMessage {
             cid,
@@ -674,7 +663,7 @@ impl FidoClient {
                         ctap_status_name(status),
                         started_at.elapsed().as_millis()
                     );
-                    trace_payload("Broker answer", &message.payload, sensitive);
+                    trace_payload("Broker answer", &message.payload);
                     return Ok(message.payload);
                 }
                 debug!(
@@ -969,9 +958,9 @@ fn client_pin_subcommand_name(subcommand: u8) -> &'static str {
         0x03 => "setPIN",
         0x04 => "changePIN",
         CLIENT_PIN_GET_PIN_TOKEN => "getPinToken",
-        CLIENT_PIN_TOKEN_USING_PIN => "getPinUvAuthTokenUsingPinWithPermissions",
-        CLIENT_PIN_GET_UV_RETRIES => "getUVRetries",
         CLIENT_PIN_TOKEN_USING_UV => "getPinUvAuthTokenUsingUvWithPermissions",
+        CLIENT_PIN_GET_UV_RETRIES => "getUVRetries",
+        CLIENT_PIN_TOKEN_USING_PIN => "getPinUvAuthTokenUsingPinWithPermissions",
         _ => "unknown",
     }
 }
@@ -1075,20 +1064,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Trace-level payload dump. `redact` is set for every PIN protocol exchange:
-/// those payloads only ever carry ciphertext, but nothing on a PIN code path is
-/// written to the log. The PIN itself never leaves pinentry and
-/// `obtain_physical_pin_token`, and no logging path can reach it.
+/// Trace-level payload summary: its size, never its content. A CTAP payload
+/// carries the RP, the user name and display name of a new credential, and
+/// credential identifiers; PIN protocol exchanges carry key agreements and
+/// encrypted tokens. None of it belongs in a log, whatever its level.
 #[cfg(any(target_os = "linux", windows))]
-fn trace_payload(label: &str, payload: &[u8], redact: bool) {
-    if !log_enabled!(log::Level::Trace) {
-        return;
-    }
-    if redact {
-        trace!("{label}: {} byte(s) withheld (PIN protocol)", payload.len());
-    } else {
-        trace!("{label}: {}", hex(payload));
-    }
+fn trace_payload(label: &str, payload: &[u8]) {
+    trace!("{label}: {} byte(s)", payload.len());
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -1435,11 +1417,16 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
                 b"SETTITLE Sanzu - YubiKey locale\nSETPROMPT PIN:\nSETDESC Entrez le PIN de la YubiKey branchee sur cet ordinateur\nGETPIN\nBYE\n",
             )?;
         }
-        let mut stdout = String::new();
+        // `stdout` carries the PIN on its `D ` line. It is wiped on drop, and
+        // its capacity is reserved and the read bounded to it so the buffer is
+        // never reallocated: a reallocation would leave a copy of the PIN in
+        // freed memory that nothing wipes.
+        let mut stdout = Zeroizing::new(String::with_capacity(PINENTRY_OUTPUT_LIMIT));
         child
             .stdout
             .take()
             .context("Cannot open pinentry output")?
+            .take(PINENTRY_OUTPUT_LIMIT as u64)
             .read_to_string(&mut stdout)?;
         let status = child.wait().context("Cannot wait for pinentry")?;
         // `stdout` carries the PIN on its `D ` line: only the exit status, the
@@ -1464,7 +1451,7 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
             if pin.is_empty() {
                 return Err(anyhow!("The local PIN prompt returned an empty PIN"));
             }
-            return Ok(Zeroizing::new(pin));
+            return Ok(pin);
         }
         debug!("{program} returned no PIN line; treating it as a cancellation");
         return Err(anyhow!("The local PIN prompt was cancelled"));
@@ -1479,7 +1466,10 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
     ))
 }
 
-fn decode_assuan_data(encoded: &str) -> Result<String> {
+/// Decodes the Assuan `D ` line into the PIN, wiped on drop. The bytes are
+/// decoded into a buffer sized up front, then moved, not copied, into the
+/// returned string: no intermediate copy of the PIN outlives this function.
+fn decode_assuan_data(encoded: &str) -> Result<Zeroizing<String>> {
     let mut decoded = Zeroizing::new(Vec::with_capacity(encoded.len()));
     let bytes = encoded.as_bytes();
     let mut index = 0;
@@ -1499,7 +1489,14 @@ fn decode_assuan_data(encoded: &str) -> Result<String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded.to_vec()).context("pinentry returned a non-UTF-8 PIN")
+    if std::str::from_utf8(&decoded).is_err() {
+        return Err(anyhow!("pinentry returned a non-UTF-8 PIN"));
+    }
+    let bytes = std::mem::take(&mut *decoded);
+    // Checked just above; the conversion takes the buffer over without copying.
+    Ok(Zeroizing::new(
+        String::from_utf8(bytes).expect("UTF-8 checked above"),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1658,28 +1655,21 @@ pub fn same_fido_device(left: &tunnel::FidoDevice, right: &tunnel::FidoDevice) -
 /// What the device thread needs to reopen the authenticator it lost.
 pub struct FidoReopen {
     selector: Option<String>,
-    passthrough: bool,
     es256_only: bool,
     expected: tunnel::FidoDevice,
 }
 
 impl FidoReopen {
-    pub fn new(
-        selector: Option<String>,
-        passthrough: bool,
-        es256_only: bool,
-        expected: tunnel::FidoDevice,
-    ) -> Self {
+    pub fn new(selector: Option<String>, es256_only: bool, expected: tunnel::FidoDevice) -> Self {
         Self {
             selector,
-            passthrough,
             es256_only,
             expected,
         }
     }
 
     fn try_open(&self) -> Option<FidoClient> {
-        match FidoClient::open(self.selector.as_deref(), self.passthrough, self.es256_only) {
+        match FidoClient::open(self.selector.as_deref(), self.es256_only) {
             Ok(candidate) if same_fido_device(&candidate.info(), &self.expected) => {
                 info!("Local FIDO authenticator reconnected; forwarding resumed");
                 Some(candidate)
@@ -2109,6 +2099,43 @@ mod tests {
         }
     }
 
+    /// Values from CTAP 2.1, authenticatorClientPIN, written as literals: the
+    /// test must not share the constants it checks. 0x06 and 0x09 were once
+    /// swapped in the code, and a test built on the constants could not see it.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn client_pin_subcommands_follow_the_ctap_specification() {
+        for (value, name) in [
+            (0x01, "getPINRetries"),
+            (0x02, "getKeyAgreement"),
+            (0x03, "setPIN"),
+            (0x04, "changePIN"),
+            (0x05, "getPinToken"),
+            (0x06, "getPinUvAuthTokenUsingUvWithPermissions"),
+            (0x07, "getUVRetries"),
+            (0x09, "getPinUvAuthTokenUsingPinWithPermissions"),
+        ] {
+            assert_eq!(
+                client_pin_subcommand_name(value),
+                name,
+                "ClientPIN subcommand 0x{value:02x}"
+            );
+        }
+        for (value, action) in [
+            (0x01, ClientPinAction::PinRetries),
+            (0x02, ClientPinAction::KeyAgreement),
+            (0x06, ClientPinAction::IssueToken),
+            (0x07, ClientPinAction::UvRetries),
+            (0x09, ClientPinAction::IssueToken),
+        ] {
+            assert_eq!(client_pin_action(value), action, "subcommand 0x{value:02x}");
+        }
+        // setPIN, changePIN, getPinToken and the reserved 0x08 stay unreachable.
+        for value in [0x03, 0x04, 0x05, 0x08] {
+            assert_eq!(client_pin_action(value), ClientPinAction::Unsupported);
+        }
+    }
+
     #[test]
     fn pin_protocol_crypto_round_trips() {
         let first = SecretKey::random(&mut OsRng);
@@ -2132,8 +2159,12 @@ mod tests {
 
     #[test]
     fn parses_pinentry_assuan_escaping() {
-        assert_eq!(decode_assuan_data("12%2034%25").unwrap(), "12 34%");
+        assert_eq!(decode_assuan_data("12%2034%25").unwrap().as_str(), "12 34%");
         assert!(decode_assuan_data("12%2").is_err());
+        assert!(
+            decode_assuan_data("%ff").is_err(),
+            "a non-UTF-8 PIN is refused"
+        );
     }
 
     #[test]
