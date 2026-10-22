@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-10-22
+
+### Added
+- X11 client: `--monitor <index|output>` opens the client on one monitor,
+  named by its `xrandr --listmonitors` index or its output name (RandR 1.5).
+- X11 client: Ctrl+Alt+Shift+N moves the client to the next monitor, also
+  in fullscreen, which KWin otherwise refuses to move; in seamless mode the
+  window had to leave fullscreen and be moved from the window menu.
+- X11 client: set `WM_CLASS` (`sanzu_client`/`Sanzu`) and `_NET_WM_NAME`, so
+  window manager rules can match the client whatever its title.
+
 ## [0.2.10] - 2026-10-11
 
 ### Security
