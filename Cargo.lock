@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "aes",
  "anyhow",
@@ -2990,7 +2990,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu-common"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "bindgen 0.69.5",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu-web"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "base64",
@@ -3033,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "sanzu_broker"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "anyhow",
  "bindgen 0.65.1",

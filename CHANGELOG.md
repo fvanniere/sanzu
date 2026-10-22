@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-10-22
+
+### Added
+- `sanzu-web` Debian package: binary, `sanzu-web.service` unit installed
+  disabled, and examples under `/usr/share/doc/sanzu-web/examples`. The CI
+  builds and publishes it with the three other packages.
+
 ## [0.2.13] - 2026-10-22
 
 ### Added
