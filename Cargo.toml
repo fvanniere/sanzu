@@ -3,4 +3,5 @@ members = [
   "sanzu-common",
   "sanzu",
   "sanzu-broker",
+  "sanzu-web",
 ]

@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sanzu</title>
+<link rel="stylesheet" href="/sanzu.css">
+<script type="module" src="/sanzu.js"></script>
+</head>
+<body class="viewer">
+<header>
+  <span class="title">Sanzu</span>
+  <span id="status">Connecting…</span>
+  <span class="spacer"></span>
+  <button id="fullscreen" type="button">Fullscreen</button>
+  <span class="user">{{user}}</span>
+  <a href="/logout">Log out</a>
+</header>
+<div id="screen">
+  <canvas id="display" tabindex="0"></canvas>
+  <div id="overlay" hidden>
+    <p id="overlay-message"></p>
+    <button id="reconnect" type="button">Reconnect</button>
+  </div>
+</div>
+</body>
+</html>
