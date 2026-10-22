@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-10-22
+
+### Added
+- `sanzu-web` (demo): the sanzu client in a browser, in the manner of
+  Guacamole. The gateway logs users in with PAM (login / password) or OpenID
+  Connect (authorization code with PKCE), starts their server through the
+  `sanzu_broker` `on_connect` callback and relays the session over a
+  WebSocket; the browser decodes the H.264 frames with WebCodecs. Keyboard,
+  mouse, wheel, cursor, resize and clipboard are supported; not seamless
+  mode, FIDO, Kerberos nor sound. The server for browsers needs
+  `pixel_format = "yuv420p"`. Not packaged yet.
+
 ## [0.2.12] - 2026-10-22
 
 ### Added
