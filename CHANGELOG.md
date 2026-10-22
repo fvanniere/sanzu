@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-10-22
+
+### Added
+- Native Wayland client (prototype), seamless mode included: one fullscreen
+  surface, transparent and click-through outside the remote windows.
+  `wp_viewporter` scales the frame, so `--zoom` and fractional output scales
+  cost no CPU. Keyboard, mouse, wheel, ARGB cursor and clipboard follow the
+  X11 client; `--monitor`, Ctrl+Alt+Shift+N and `--grab-keyboard` work on
+  Wayland outputs.
+- `--backend auto|wayland|x11` (Linux): `auto` uses Wayland when
+  `WAYLAND_DISPLAY` is set and falls back to X11; `x11` runs through XWayland
+  in a Wayland session. No new runtime library: the Wayland protocol is
+  implemented in Rust.
+
+### Known limitations
+- Wayland client: no primary selection, no Scroll Lock synchronisation, cursor
+  not scaled to the output; keyboard and mouse still to be validated on Plasma.
+
 ## [0.2.11] - 2026-10-22
 
 ### Added
