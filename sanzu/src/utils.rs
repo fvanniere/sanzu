@@ -298,6 +298,14 @@ pub struct ClientArgsConfig {
         help = "Client will be in window mode instead of fullscreen"
     )]
     pub window_mode: bool,
+    #[cfg(unix)]
+    #[clap(
+        long,
+        help = r"Local monitor to open on: RandR index, as `xrandr --listmonitors` numbers them
+(0, 1, ...), or output name (DP-1, HDMI-A-1, ...). Ctrl+Alt+Shift+N then
+moves the client to the next monitor"
+    )]
+    pub monitor: Option<String>,
     #[clap(
         long,
         default_value_t = 1.0,

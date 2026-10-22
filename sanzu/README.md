@@ -70,6 +70,22 @@ Mouse coordinates, resized windows, and seamless areas are scaled automatically.
 the server's adaptive-resolution mode (the default); it is incompatible with
 `--keep-server-resolution`.
 
+### Multiple monitors (X11)
+
+By default the client spans the whole X11 screen and the window manager decides
+where its fullscreen window lands. `--monitor` opens it on one monitor, named by
+its index in `xrandr --listmonitors` or by its output name:
+
+```
+./sanzu_client 192.168.0.1 1122 --monitor 1
+./sanzu_client 192.168.0.1 1122 --monitor HDMI-A-1
+```
+
+Ctrl+Alt+Shift+N moves the client to the next monitor, fullscreen included: the
+window manager cannot move a fullscreen window itself. The window has the
+`WM_CLASS` `sanzu_client`/`Sanzu`, so KWin and other window managers can match it
+in their window rules.
+
 ### FIDO2 / YubiKey forwarding
 
 A Linux or Windows client can expose the FIDO interface of a local YubiKey (or
