@@ -49,6 +49,15 @@ Browsers do not decode H.264 4:4:4, the default of `sanzu.toml`: the server
 started for the browser needs `pixel_format = "yuv420p"` (see
 `demo/server.toml`).
 
+## Package
+
+`cargo deb -p sanzu-web` builds the `sanzu-web` Debian package: the binary,
+the `sanzu-web.service` unit, installed disabled, and the examples under
+`/usr/share/doc/sanzu-web/examples`. Write `/etc/sanzu/sanzu_web.toml`, then
+`systemctl enable --now sanzu-web`. The unit runs the gateway as root, like
+`sanzu_broker`: PAM reads `/etc/shadow` and the session callback expects a
+root owned socket in `/tmp`.
+
 ## Deployment
 
 The gateway speaks plain HTTP. Put it behind an HTTPS reverse proxy that

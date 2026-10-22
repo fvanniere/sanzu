@@ -34,8 +34,9 @@ package:debian:trixie:
     - cargo deb --locked -p sanzu
     - cargo deb --locked -p sanzu --variant=client
     - cargo deb --locked -p sanzu_broker
+    - cargo deb --locked -p sanzu-web
     - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
-    - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
+    - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 4
     - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
     - find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' -print
   artifacts:

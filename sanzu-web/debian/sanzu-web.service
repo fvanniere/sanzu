@@ -1,0 +1,38 @@
+[Unit]
+Description=Sanzu web gateway: the sanzu client in a browser
+Documentation=file:///usr/share/doc/sanzu-web/README
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/sanzu-web --config /etc/sanzu/sanzu_web.toml
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+
+# Root, like sanzu_broker: PAM reads /etc/shadow, the session callback
+# expects a root owned socket in /tmp and starts units as the user. Behind a
+# reverse proxy, the gateway only listens on the loopback.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=false
+PrivateDevices=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 [package]
 name = "sanzu-web"
-version = "0.2.13"
+version = "0.2.14"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 readme = "README.md"
@@ -26,3 +26,24 @@ tungstenite = { version = "0.21", default-features = false, features = ["handsha
 ureq = { version = "2.9", features = ["json", "native-certs"] }
 url = "2.4"
 uuid = { version = "1.3", features = ["v4"] }
+
+[package.metadata.deb]
+name = "sanzu-web"
+maintainer = "Fabrice Desclaux <fabrice.desclaux@cea.fr>"
+copyright = "2021, CEA <fabrice.desclaux@cea.fr>"
+extended-description = """\
+Web gateway for sanzu video server: logs users in (PAM or OpenID Connect), \
+starts their sanzu server and relays the session to a browser over a \
+WebSocket. The unit is installed disabled: write /etc/sanzu/sanzu_web.toml \
+first (example in /usr/share/doc/sanzu-web/examples)."""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+    ["target/release/sanzu-web", "usr/bin/", "755"],
+    ["debian/sanzu-web.service", "usr/lib/systemd/system/sanzu-web.service", "644"],
+    ["sanzu_web.toml", "usr/share/doc/sanzu-web/examples/sanzu_web.toml", "644"],
+    ["demo/server.toml", "usr/share/doc/sanzu-web/examples/server.toml", "644"],
+    ["demo/session.sh", "usr/share/doc/sanzu-web/examples/session.sh", "644"],
+    ["README.md", "usr/share/doc/sanzu-web/README", "644"],
+]

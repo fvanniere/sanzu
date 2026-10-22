@@ -12,6 +12,8 @@ debian11:
 		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
 	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu_broker" \
 		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
+	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu-web" \
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian11
 
 debian12:
 	docker build -t sanzu-builder:debian12 -f Dockerfile-debian12 .
@@ -20,6 +22,8 @@ debian12:
 	docker run -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu --variant=client" \
 		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
 	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu_broker" \
+		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
+	docker run --rm -t $(DOCKER_OPT) -u ${DOCKER_USER} --env CARGODEB_OPT="-p sanzu-web" \
 		--env CARGO_OPT=$(CARGO_OPT) sanzu-builder:debian12
 
 alpine:
