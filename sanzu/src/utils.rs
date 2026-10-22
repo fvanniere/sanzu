@@ -301,11 +301,22 @@ pub struct ClientArgsConfig {
     #[cfg(unix)]
     #[clap(
         long,
-        help = r"Local monitor to open on: RandR index, as `xrandr --listmonitors` numbers them
-(0, 1, ...), or output name (DP-1, HDMI-A-1, ...). Ctrl+Alt+Shift+N then
-moves the client to the next monitor"
+        help = r"Local monitor to open on: output name (DP-1, HDMI-A-1, ...) or index (0, 1, ...),
+as `xrandr --listmonitors` numbers them on X11, in compositor order on Wayland.
+Ctrl+Alt+Shift+N then moves the client to the next monitor"
     )]
     pub monitor: Option<String>,
+    #[cfg(target_os = "linux")]
+    #[clap(
+        long,
+        default_value = "auto",
+        help = r"Display backend:
+ - auto: Wayland when WAYLAND_DISPLAY is set, else X11
+ - wayland: native Wayland
+ - x11: X11, through XWayland in a Wayland session
+"
+    )]
+    pub backend: String,
     #[clap(
         long,
         default_value_t = 1.0,

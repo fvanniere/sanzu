@@ -250,6 +250,39 @@ impl ClientInterface for StdioClientInterface {
 /// - image update if necessary
 ///
 
+/// Pick the display backend: native Wayland in a Wayland session, unless
+/// `--backend x11` asks for X11 (XWayland there)
+#[cfg(target_os = "linux")]
+fn init_linux_graphics(
+    arguments: &ClientArgsConfig,
+    seamless: bool,
+    server_size: Option<(u16, u16)>,
+) -> Result<Box<dyn crate::client_utils::Client>> {
+    let init_x11 = || init_x11rb(arguments, seamless, server_size).context("Error in init_x11rb");
+    let init_wayland = || {
+        crate::client_wayland::init_wayland(arguments, seamless, server_size)
+            .context("Error in init_wayland")
+    };
+    match arguments.backend.as_str() {
+        "wayland" => init_wayland(),
+        "x11" => init_x11(),
+        "auto" => {
+            if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                return init_x11();
+            }
+            match init_wayland() {
+                Ok(client) => Ok(client),
+                Err(err) if std::env::var_os("DISPLAY").is_some() => {
+                    warn!("Wayland client failed, falling back to X11: {:?}", err);
+                    init_x11()
+                }
+                Err(err) => Err(err),
+            }
+        }
+        backend => Err(anyhow!("Unknown display backend: {backend}")),
+    }
+}
+
 pub fn run(
     client_config: &ConfigClient,
     arguments: &ClientArgsConfig,
@@ -555,7 +588,10 @@ pub fn do_run(
         _ => None,
     };
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    let mut client = init_linux_graphics(arguments, seamless, server_size)
+        .map_err(|err| send_client_err_event(server, err))?;
+    #[cfg(all(unix, not(target_os = "linux")))]
     let mut client = init_x11rb(arguments, seamless, server_size)
         .context("Error in init_x11rb")
         .map_err(|err| send_client_err_event(server, err))?;

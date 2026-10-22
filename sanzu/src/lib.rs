@@ -13,6 +13,8 @@ extern crate sanzu_common;
 
 pub mod client;
 pub mod client_utils;
+#[cfg(target_os = "linux")]
+pub mod client_wayland;
 #[cfg(windows)]
 pub mod client_wind3d;
 #[cfg(unix)]

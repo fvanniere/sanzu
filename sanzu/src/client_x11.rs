@@ -124,7 +124,7 @@ fn get_monitors<C: Connection>(conn: &C, root: Window) -> Result<Vec<Monitor>> {
 }
 
 /// Find the monitor named by `selector`: its RandR index or its output name
-fn select_monitor<'a>(monitors: &'a [Monitor], selector: &str) -> Result<&'a Monitor> {
+pub(crate) fn select_monitor<'a>(monitors: &'a [Monitor], selector: &str) -> Result<&'a Monitor> {
     let found = match selector.parse::<usize>() {
         Ok(index) => monitors.get(index),
         Err(_) => monitors.iter().find(|monitor| monitor.name == selector),
