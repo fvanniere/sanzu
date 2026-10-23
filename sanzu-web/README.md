@@ -6,12 +6,12 @@ the session over a WebSocket. Nothing to install on the client side.
 
 ```
 browser ── HTTPS / WebSocket ──> sanzu-web ── unix socket ──> sanzu_server
- WebCodecs (H.264)               PAM / OIDC                   (started by
+ WebCodecs (H.264, VP9, AV1)     PAM / OIDC                   (started by
  keyboard, mouse, clipboard      sanzu protocol client         on_connect)
 ```
 
 The gateway plays the sanzu client, as guacd does for Guacamole: the browser
-gets the H.264 frames untouched and decodes them with WebCodecs (in hardware
+gets the video frames untouched and decodes them with WebCodecs (in hardware
 when it can), and sends its input as small JSON messages. The messages are
 described at the top of `src/session.rs`.
 
@@ -47,7 +47,9 @@ sanzu_server --config server.toml --unixsock --connect-unixsock --address %UNIX_
 
 Browsers do not decode H.264 4:4:4, the default of `sanzu.toml`: the server
 started for the browser needs `pixel_format = "yuv420p"` (see
-`demo/server.toml`).
+`demo/server.toml`). For a sharp image, use VP9 4:4:4 instead
+(`--encoder libvpx-vp9`, `pixel_format = "yuv444p"`), which browsers decode.
+AV1 (`--encoder libsvtav1`) works too, in 4:2:0.
 
 ## Package
 

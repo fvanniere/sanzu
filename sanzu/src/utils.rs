@@ -93,7 +93,7 @@ pub struct ServerArgsConfig {
         long,
         short = 'e',
         default_value = "libx264",
-        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc"
+        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc, libsvtav1, libvpx-vp9"
     )]
     pub encoder: String,
     #[clap(
@@ -430,7 +430,7 @@ pub struct ProxyArgsConfig {
         long,
         short = 'e',
         default_value = "libx264",
-        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc"
+        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc, libsvtav1, libvpx-vp9"
     )]
     pub encoder: String,
     #[clap(

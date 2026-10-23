@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Server: AV1 (`libsvtav1`, `libaom-av1`, `av1_nvenc`, `av1_qsv`, `av1_amf`)
+  and VP9 (`libvpx-vp9`, `vp9_qsv`) encoders. The client decodes AV1 with
+  dav1d.
+- sanzu-web: VP9 and AV1 decoding with WebCodecs. VP9 4:4:4 gives browsers a
+  sharp image, which H.264 4:4:4 cannot.
+- Low latency `libsvtav1` and `libvpx-vp9` sections in `sanzu.toml`, and
+  recommended settings without GPU encoding in the README.
+
+### Fixed
+- Client: decode the frame as soon as the FFmpeg parser returns it. The AV1
+  and VP9 parsers return it on the call that consumes the input, and the next
+  call, with no input left, dropped it.
+
 ## [0.2.15] - 2026-10-23
 
 ### Added

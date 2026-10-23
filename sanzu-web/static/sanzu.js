@@ -98,8 +98,8 @@ function* nalUnits(data) {
   if (start >= 0 && start < data.length) yield data.subarray(start);
 }
 
-// Codec string from the SPS (profile, constraints, level), and IDR presence
-function inspect(data) {
+// H.264 codec string from the SPS (profile, constraints, level), and IDR presence
+function inspectH264(data) {
   let codec = null;
   let key = false;
   for (const nal of nalUnits(data)) {
@@ -114,11 +114,116 @@ function inspect(data) {
   return { codec, key };
 }
 
+// VP9 and AV1 headers carry no level the decoder needs: pick one from the size
+function levelForSize(width, height, levels) {
+  const area = width * height;
+  return area <= 2228224 ? levels[0] : area <= 8912896 ? levels[1] : levels[2];
+}
+
+// VP9 codec string from the uncompressed header of a key frame (profile 1
+// is 4:4:4), and key frame presence
+function inspectVp9(data, width, height) {
+  if (data.length < 1 || data[0] >> 6 !== 2) return { codec: null, key: false };
+  const profile = ((data[0] >> 5) & 1) | (((data[0] >> 4) & 1) << 1);
+  const shift = profile === 3 ? 1 : 0;
+  const showExisting = (data[0] >> (3 - shift)) & 1;
+  const key = !showExisting && ((data[0] >> (2 - shift)) & 1) === 0;
+  if (!key) return { codec: null, key };
+  const level = levelForSize(width, height, ["41", "51", "61"]);
+  const depth = profile >= 2 ? "10" : "08";
+  return { codec: `vp09.0${profile}.${level}.${depth}`, key };
+}
+
+class BitReader {
+  constructor(bytes) {
+    this.bytes = bytes;
+    this.pos = 0;
+  }
+
+  read(count) {
+    let value = 0;
+    for (let i = 0; i < count; i++) {
+      const byte = this.bytes[this.pos >> 3] ?? 0;
+      value = (value << 1) | ((byte >> (7 - (this.pos & 7))) & 1);
+      this.pos += 1;
+    }
+    return value;
+  }
+}
+
+// Profile, level and tier of an AV1 sequence header; the level is only read
+// when no timing info precedes it
+function av1SequenceCodec(obu, width, height) {
+  const bits = new BitReader(obu);
+  const profile = bits.read(3);
+  bits.read(1); // still_picture
+  const reduced = bits.read(1);
+  let level = null;
+  let tier = "M";
+  if (reduced) {
+    level = bits.read(5);
+  } else if (!bits.read(1)) {
+    bits.read(1); // initial_display_delay_present_flag
+    bits.read(5); // operating_points_cnt_minus_1
+    bits.read(12); // operating_point_idc[0]
+    level = bits.read(5);
+    if (level > 7 && bits.read(1)) tier = "H";
+  }
+  const levelText = level === null
+    ? levelForSize(width, height, ["09", "13", "17"])
+    : String(level).padStart(2, "0");
+  return { codec: `av01.${profile}.${levelText}${tier}.08`, reduced: reduced === 1 };
+}
+
+// Low overhead AV1 stream: codec string from the sequence header, and key
+// frame presence from the frame header
+let av1Reduced = false;
+function inspectAv1(data, width, height) {
+  let codec = null;
+  let key = false;
+  let pos = 0;
+  while (pos < data.length) {
+    const header = data[pos];
+    const type = (header >> 3) & 0x0f;
+    const extension = (header >> 2) & 1;
+    const hasSize = (header >> 1) & 1;
+    pos += 1 + extension;
+    let size = data.length - pos;
+    if (hasSize) {
+      size = 0;
+      for (let i = 0; i < 8 && pos < data.length; i++) {
+        const byte = data[pos++];
+        size += (byte & 0x7f) * 2 ** (7 * i);
+        if (!(byte & 0x80)) break;
+      }
+    }
+    const obu = data.subarray(pos, pos + size);
+    if (type === 1) {
+      const sequence = av1SequenceCodec(obu, width, height);
+      codec = sequence.codec;
+      av1Reduced = sequence.reduced;
+    } else if ((type === 3 || type === 6) && obu.length > 0) {
+      // KEY_FRAME is frame_type 0, after show_existing_frame
+      key = key || av1Reduced || (obu[0] & 0xe0) === 0;
+    }
+    pos += size;
+  }
+  return { codec, key };
+}
+
+// Codec announced by the server hello: h264, vp9 or av1
+let streamCodec = "h264";
+function inspect(data, width, height) {
+  if (streamCodec === "vp9") return inspectVp9(data, width, height);
+  if (streamCodec === "av1") return inspectAv1(data, width, height);
+  return inspectH264(data);
+}
+
 async function configureDecoder(codec, width, height) {
   const config = { codec, codedWidth: width, codedHeight: height, optimizeForLatency: true };
   const support = await VideoDecoder.isConfigSupported(config);
   if (!support.supported) {
-    throw new Error(`This browser cannot decode ${codec}: ask for yuv420p on the server`);
+    throw new Error(`This browser cannot decode ${codec}: ask for another codec or yuv420p on the server`);
   }
   if (!decoder || decoder.state === "closed") {
     decoder = new VideoDecoder({
@@ -144,7 +249,7 @@ let decodeQueue = Promise.resolve();
 let frameIndex = 0;
 
 function onFrame(width, height, data) {
-  const { codec, key } = inspect(data);
+  const { codec, key } = inspect(data, width, height);
   decodeQueue = decodeQueue.then(async () => {
     if (codec && (!decoderConfig || decoderConfig.codec !== codec
         || decoderConfig.codedWidth !== width || decoderConfig.codedHeight !== height)) {
@@ -197,6 +302,7 @@ function onBinary(buffer) {
 function onText(text) {
   const message = JSON.parse(text);
   if (message.t === "hello") {
+    streamCodec = message.codec;
     setStatus(`Connected (${message.codec})`);
   } else if (message.t === "clipboard") {
     navigator.clipboard?.writeText(message.data).catch((err) => {

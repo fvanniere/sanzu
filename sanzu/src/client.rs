@@ -38,7 +38,7 @@ use crate::{
         get_xwd_data, ClientArgsConfig, HasTimeout, MAX_BYTES_PER_LINE, MAX_CURSOR_HEIGHT,
         MAX_CURSOR_WIDTH, MAX_WINDOW_HEIGHT, MAX_WINDOW_WIDTH,
     },
-    video_decoder::init_video_codec,
+    video_decoder::{default_decoder_name, init_video_codec},
 };
 
 /// Flash message shown when the user pastes in clipboard trig mode without
@@ -565,7 +565,7 @@ pub fn do_run(
     let server_allows_fido = msg.fido;
     let codec_name = match &arguments.decoder {
         Some(decoder_name) => decoder_name.to_owned(),
-        None => msg.codec_name.to_owned(),
+        None => default_decoder_name(&msg.codec_name).to_owned(),
     };
     let (seamless, server_size) = match msg.msg {
         Some(tunnel::server_hello::Msg::AdaptScreen(adapt_screen)) => (adapt_screen.seamless, None),

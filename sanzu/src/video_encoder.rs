@@ -656,6 +656,8 @@ pub fn get_encoder_category(encoder_name: &String) -> Result<String> {
     let codec_name = match encoder_name.as_str() {
         "libx264" | "h264_nvenc" | "h264_qsv" | "h264_v4l2m2m" | "h264_amf" => "h264",
         "libx265" | "hevc_nvenc" | "hevc_qsv" | "hevc_amf" => "hevc",
+        "libsvtav1" | "libaom-av1" | "av1_nvenc" | "av1_qsv" | "av1_amf" => "av1",
+        "libvpx-vp9" | "vp9_qsv" => "vp9",
         "null" => "null",
         _ => {
             return Err(anyhow!("Unknown encoder category: {:?}", encoder_name));
