@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-10-23
+
+### Changed
+- CI: the Debian package job runs only on runners tagged `online`, as it
+  downloads Debian packages, cargo-deb and crates.
+
 ## [0.2.16] - 2026-10-23
 
 ### Added
