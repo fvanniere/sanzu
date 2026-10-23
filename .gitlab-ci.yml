@@ -10,6 +10,9 @@ variables:
 package:debian:trixie:
   stage: package
   image: rust:1-trixie
+  # apt-get, cargo install and cargo deb download from the internet
+  tags:
+    - online
   cache:
     key: cargo-debian-trixie-rust-1-cargo-deb-2.9.2
     paths:
