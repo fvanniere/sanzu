@@ -288,7 +288,7 @@ pub struct ClientArgsConfig {
         help = r#"Control clipboard behavior:
  - allow: send clipboard to server on local clipboard modification
  - deny: never send local clipboard to server
- - trig: send local clipboard to server on hitting special shortcut
+ - trig: send local clipboard to server on hitting Ctrl+Alt+Shift+C or Ctrl+Alt+Shift+V
 "#
     )]
     pub clipboard: String,

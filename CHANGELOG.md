@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Client, clipboard `trig` mode: pasting (Ctrl+V, Ctrl+Shift+V, Shift+Insert)
+  while the local clipboard has not been sent displays a flash message, in
+  French, at the top of the session for 3 seconds (X11, Wayland and Windows
+  clients).
+- Client, clipboard `trig` mode: Ctrl+Alt+Shift+V sends the local clipboard,
+  like Ctrl+Alt+Shift+C.
+
+### Changed
+- The client OSD (stats, flash messages) uses the ISO 8859-1 font, to display
+  accented characters.
+
 ## [0.2.14] - 2026-10-22
 
 ### Added

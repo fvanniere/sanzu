@@ -9,7 +9,7 @@
 //! output scales without CPU work.
 
 use crate::{
-    client_utils::{Area, Client},
+    client_utils::{is_paste_shortcut, Area, Client},
     client_x11::{select_monitor, Monitor},
     utils::{ClientArgsConfig, ClipboardConfig},
 };
@@ -89,6 +89,7 @@ const KEY_SHIFT: usize = 50;
 const KEY_ALT: usize = 64;
 const KEY_S: u32 = 39;
 const KEY_C: u32 = 54;
+const KEY_V: u32 = 55;
 const KEY_H: u32 = 43;
 const KEY_N: u32 = 57;
 
@@ -235,6 +236,8 @@ pub struct WaylandState {
     frame_ready: bool,
     display_stats: bool,
     clipboard_trig: bool,
+    /// The user pressed a paste shortcut
+    clipboard_paste: bool,
     grab_keyboard: bool,
     locked_modifiers: u32,
     sync_key_locks_needed: bool,
@@ -257,6 +260,10 @@ pub struct ClientWayland {
     clipboard_config: ClipboardConfig,
     clipboard_event_receiver: Receiver<String>,
     clipboard_last_value: Option<String>,
+    /// The last seen clipboard value has not been sent to the server
+    clipboard_pending: bool,
+    /// The user pasted without sending the clipboard
+    clipboard_warning: bool,
 }
 
 fn bind_optional<I, State>(globals: &GlobalList, qh: &QueueHandle<State>) -> Option<I>
@@ -394,7 +401,7 @@ impl WaylandState {
                 self.display_stats = !self.display_stats;
                 info!("Toggle server logs");
             }
-            KEY_C => self.clipboard_trig = true,
+            KEY_C | KEY_V => self.clipboard_trig = true,
             KEY_H => {
                 self.grab_keyboard = !self.grab_keyboard;
                 if !self.grab_keyboard {
@@ -532,6 +539,7 @@ pub fn init_wayland(
         frame_ready: false,
         display_stats: false,
         clipboard_trig: false,
+        clipboard_paste: false,
         grab_keyboard: arguments.grab_keyboard,
         locked_modifiers: 0,
         sync_key_locks_needed: arguments.sync_key_locks,
@@ -634,6 +642,8 @@ pub fn init_wayland(
         clipboard_config,
         clipboard_event_receiver,
         clipboard_last_value: None,
+        clipboard_pending: false,
+        clipboard_warning: false,
     }))
 }
 
@@ -780,6 +790,8 @@ impl Client for ClientWayland {
     }
 
     fn set_clipboard(&mut self, data: &str) -> Result<()> {
+        // The local clipboard now matches the remote one
+        self.clipboard_pending = false;
         let state = &mut self.state;
         if let (Some(manager), Some(device)) = (&state.data_device_manager, &state.data_device) {
             let qh = self.event_queue.handle();
@@ -848,6 +860,7 @@ impl Client for ClientWayland {
                 .is_some_and(|(_, value)| *value == data);
             if !own {
                 self.clipboard_last_value = Some(data);
+                self.clipboard_pending = true;
             }
         }
 
@@ -871,10 +884,15 @@ impl Client for ClientWayland {
                             },
                         )),
                     });
+                    self.clipboard_pending = false;
                 }
                 state.clipboard_trig = false;
+                if state.clipboard_paste && self.clipboard_pending {
+                    self.clipboard_warning = true;
+                }
             }
         }
+        state.clipboard_paste = false;
 
         Ok(tunnel::MessagesClient {
             msgs: events,
@@ -884,6 +902,10 @@ impl Client for ClientWayland {
 
     fn display_stats(&self) -> bool {
         self.state.display_stats
+    }
+
+    fn clipboard_warning(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_warning)
     }
 
     fn printfile(&self, file: &str) -> Result<()> {
@@ -1089,6 +1111,9 @@ impl Dispatch<WlKeyboard, ()> for WaylandState {
                 }
                 if updown {
                     state.handle_shortcuts(qh, keycode);
+                    if is_paste_shortcut(&state.keys_state, keycode as usize) {
+                        state.clipboard_paste = true;
+                    }
                 }
                 state.events.push(tunnel::MessageClient {
                     msg: Some(tunnel::message_client::Msg::Key(tunnel::EventKey {

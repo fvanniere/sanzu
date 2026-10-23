@@ -1,5 +1,5 @@
 use crate::{
-    client_utils::{Area, Client},
+    client_utils::{is_paste_shortcut, Area, Client},
     utils::{ClientArgsConfig, ClipboardConfig, ClipboardSelection},
     utils_x11,
 };
@@ -43,6 +43,7 @@ const KEY_SHIFT: usize = 50;
 const KEY_ALT: usize = 64;
 const KEY_S: usize = 39;
 const KEY_C: usize = 54;
+const KEY_V: usize = 55;
 const KEY_H: usize = 43;
 /// Same physical key, labelled N, on QWERTY, AZERTY and QWERTZ layouts
 const KEY_N: usize = 57;
@@ -218,6 +219,12 @@ pub struct ClientInfo {
     pub display_stats: bool,
     /// Bool to trig clipboard send
     pub clipbard_trig: bool,
+    /// The last seen clipboard value has not been sent to the server
+    pub clipboard_pending: bool,
+    /// The user pressed a paste shortcut
+    pub clipboard_paste: bool,
+    /// The user pasted without sending the clipboard
+    pub clipboard_warning: bool,
     /// Sync caps/num/scroll lock
     pub sync_key_locks: bool,
     /// is key lock sync needed
@@ -623,6 +630,9 @@ pub fn init_x11rb(
         skip_clipboard_clipboard,
         display_stats: false,
         clipbard_trig: false,
+        clipboard_pending: false,
+        clipboard_paste: false,
+        clipboard_warning: false,
         sync_key_locks: arguments.sync_key_locks,
         sync_key_locks_needed: arguments.sync_key_locks,
         areas: vec![],
@@ -1103,6 +1113,9 @@ impl Client for ClientInfo {
     }
 
     fn set_clipboard(&mut self, data: &str) -> Result<()> {
+        // The local clipboard now matches the remote one
+        self.clipboard_pending = false;
+
         /* Set *both* clipboards (primary and clipboard) */
         *self.skip_clipboard_clipboard.lock().unwrap() += 1;
         utils_x11::set_clipboard(&self.clipboard, 0, data).context("Error in set_clipboard")?;
@@ -1209,8 +1222,8 @@ impl Client for ClientInfo {
                         }
                     }
 
-                    // If Ctrl alt shift c => Trig clipboard event
-                    if event.detail == KEY_C as u8 {
+                    // If Ctrl alt shift c or v => Trig clipboard event
+                    if event.detail == KEY_C as u8 || event.detail == KEY_V as u8 {
                         // Ctrl Shift Alt
                         if self.keys_state[KEY_CTRL]
                             && self.keys_state[KEY_SHIFT]
@@ -1218,6 +1231,10 @@ impl Client for ClientInfo {
                         {
                             self.clipbard_trig = true;
                         }
+                    }
+
+                    if is_paste_shortcut(&self.keys_state, event.detail as usize) {
+                        self.clipboard_paste = true;
                     }
 
                     // If Ctrl alt shift h => toggle grab keyboard
@@ -1341,6 +1358,7 @@ impl Client for ClientInfo {
         /* Get clipboard events */
         if let Some(data) = get_clipboard_events(&self.clipboard_event_receiver) {
             self.clipboard_last_value = Some(data);
+            self.clipboard_pending = true;
         }
 
         events.extend(last_move);
@@ -1369,10 +1387,16 @@ impl Client for ClientInfo {
                         msg: Some(tunnel::message_client::Msg::Clipboard(eventclipboard)),
                     };
                     events.push(clipboard_msg);
+                    self.clipboard_pending = false;
                 }
                 self.clipbard_trig = false;
+                if self.clipboard_paste && self.clipboard_pending {
+                    self.clipboard_warning = true;
+                }
             }
         }
+
+        self.clipboard_paste = false;
 
         Ok(tunnel::MessagesClient {
             msgs: events,
@@ -1382,6 +1406,10 @@ impl Client for ClientInfo {
 
     fn display_stats(&self) -> bool {
         self.display_stats
+    }
+
+    fn clipboard_warning(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_warning)
     }
 
     fn printfile(&self, file: &str) -> Result<()> {

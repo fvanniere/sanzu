@@ -5,7 +5,7 @@ use embedded_graphics::primitives::{rectangle::Rectangle, PrimitiveStyle};
 use embedded_graphics::Pixel;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_7X13, MonoTextStyle},
+    mono_font::{iso_8859_1::FONT_7X13, MonoTextStyle},
     prelude::*,
     text::Text,
 };
@@ -128,10 +128,13 @@ impl<'a> DrawTarget for TestDisplay<'a> {
 }
 
 pub fn draw_text(display: &mut TestDisplay, text: &str, x: i32, y: i32) {
-    Rectangle::new(Point::new(x, y - 9), Size::new(7 * (text.len() as u32), 13))
-        .into_styled(PrimitiveStyle::with_fill(Rgb888::BLACK))
-        .draw(display)
-        .expect("Cannot draw rectangle");
+    Rectangle::new(
+        Point::new(x, y - 9),
+        Size::new(7 * (text.chars().count() as u32), 13),
+    )
+    .into_styled(PrimitiveStyle::with_fill(Rgb888::BLACK))
+    .draw(display)
+    .expect("Cannot draw rectangle");
 
     let style = MonoTextStyle::new(&FONT_7X13, Rgb888::WHITE);
     let text_front = Text::new(text, Point::new(x, y), style);
