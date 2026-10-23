@@ -27,6 +27,25 @@ Here are some examples: In this case, the remote sanzu server runs under a linux
 
 Screenshots are in PNG to show original compression details.
 
+## Recommended settings without GPU encoding
+
+When no hardware encoder is available, `libx264` on a modern multi-core CPU can still reach low latency. In the server configuration (`sanzu.toml`):
+
+```toml
+[ffmpeg.libx264]
+pixel_format = "yuv420p"
+preset = "superfast"
+tune = "zerolatency"
+x264-params = "intra-refresh=1:keyint=80:scenecut=0"
+```
+
+- `preset = "superfast"` (or `ultrafast` on slower CPUs): the `fast` preset is too slow for interactive use; these presets use a cheap motion search and a single reference frame.
+- `tune = "zerolatency"`: no B-frames, no lookahead, and each frame is split in slices encoded in parallel by several threads (`sliced-threads`).
+- `pixel_format = "yuv420p"`: `yuv444p` encodes twice as much chroma data; keep it only if colored text looks blurry.
+- `intra-refresh=1`: replaces periodic keyframes by a moving column of intra blocks, which avoids bitrate and latency spikes. `keyint` is then the number of frames needed to refresh the whole image (here 2 seconds at `max_fps = 40`).
+
+The server logs `grab`, `encode` and `send` times for each frame: check them to see where time is spent before tuning further.
+
 Sanzu client running in seamless mode under windows (both windows are from the remote server)
 ![Alt text](misc/screenshot/sanzu_windows.png?raw=true "Sanzu client running in seamless mode under windows")
 
