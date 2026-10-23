@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-10-23
+
 ### Added
 - Server: AV1 (`libsvtav1`, `libaom-av1`, `av1_nvenc`, `av1_qsv`, `av1_amf`)
   and VP9 (`libvpx-vp9`, `vp9_qsv`) encoders. The client decodes AV1 with
