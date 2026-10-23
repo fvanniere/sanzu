@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-10-23
+
 ### Added
 - Client, clipboard `trig` mode: pasting (Ctrl+V, Ctrl+Shift+V, Shift+Insert)
   while the local clipboard has not been sent displays a flash message, in
