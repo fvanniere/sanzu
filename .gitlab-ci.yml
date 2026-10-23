@@ -55,7 +55,7 @@ package:debian:trixie:
 publish:debian:trixie:
   stage: publish
   image:
-    name: curlimages/curl:8.12.1
+    name: debian:trixie
     entrypoint: [""]
   needs:
     - job: package:debian:trixie
