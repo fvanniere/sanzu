@@ -60,6 +60,10 @@ publish:debian:trixie:
   needs:
     - job: package:debian:trixie
       artifacts: true
+  before_script:
+    # debian:trixie n'a pas curl : l'envoi vers le registry en a besoin.
+    - apt-get update -qq
+    - apt-get install -qq -y --no-install-recommends ca-certificates curl >/dev/null
   script:
     - PACKAGE_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' sanzu/Cargo.toml)"
     - |
