@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Selection pass; Reset, Config, CredentialManagement, BioEnrollment,
   LargeBlobs and the vendor commands are answered locally with
   `CTAP1_ERR_INVALID_COMMAND`. GetInfo no longer advertises these features.
+- Server (Linux): the X server joined through `DISPLAY` must run as the uid
+  of `sanzu_server` (or root), checked with `SO_PEERCRED` on the socket.
+  x11rb tries the abstract socket `@/tmp/.X11-unix/X<n>` first, which any
+  process of the network namespace may create: another account squatting a
+  free display would otherwise receive the MIT cookie and the input events.
 
 ### Fixed
 - FIDO traces: the CTAPHID command names (PING, LOCK, CANCEL, KEEPALIVE) used
