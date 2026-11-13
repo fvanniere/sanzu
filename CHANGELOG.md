@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process of the network namespace may create: another account squatting a
   free display would otherwise receive the MIT cookie and the input events.
 
+### Changed
+- CI: each build of `main` gets its own Debian revision, `1+git<pipeline
+  iid>`, and is published under the registry version
+  `<version>-1+git<pipeline iid>`. Every commit of main was published as
+  `<version>-1`, which the lab repository refused as a duplicate. Release tags
+  keep the `-1` revision.
+
 ### Fixed
 - FIDO traces: the CTAPHID command names (PING, LOCK, CANCEL, KEEPALIVE) used
   wrong codes.
