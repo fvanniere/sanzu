@@ -32,12 +32,32 @@ pub const FIDO_REPORT_SIZE: usize = 64;
 const MAX_REPORTS_PER_CYCLE: usize = 64;
 const FIDO_USAGE_PAGE: u16 = 0xf1d0;
 const FIDO_USAGE: u16 = 0x0001;
-const CTAPHID_CBOR: u8 = 0x10;
+// CTAPHID transport commands (CTAP 2.1, 11.2.9). 0x40 to 0x7f are vendor
+// commands, used for instance by ykman to read and write the YubiKey
+// configuration through the FIDO interface.
+const CTAPHID_PING: u8 = 0x01;
+const CTAPHID_MSG: u8 = 0x03;
+const CTAPHID_LOCK: u8 = 0x04;
 const CTAPHID_INIT: u8 = 0x06;
+const CTAPHID_WINK: u8 = 0x08;
+const CTAPHID_CBOR: u8 = 0x10;
+const CTAPHID_CANCEL: u8 = 0x11;
+const CTAPHID_KEEPALIVE: u8 = 0x3b;
+const CTAPHID_ERROR: u8 = 0x3f;
+// CTAPHID_ERROR codes
+const CTAPHID_ERR_INVALID_CMD: u8 = 0x01;
+const CTAPHID_ERR_INVALID_LEN: u8 = 0x03;
 const CTAP_GET_INFO: u8 = 0x04;
 const CTAP_CLIENT_PIN: u8 = 0x06;
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_GET_ASSERTION: u8 = 0x02;
+const CTAP_RESET: u8 = 0x07;
+const CTAP_GET_NEXT_ASSERTION: u8 = 0x08;
+const CTAP_BIO_ENROLLMENT: u8 = 0x09;
+const CTAP_CREDENTIAL_MANAGEMENT: u8 = 0x0a;
+const CTAP_SELECTION: u8 = 0x0b;
+const CTAP_LARGE_BLOBS: u8 = 0x0c;
+const CTAP_CONFIG: u8 = 0x0d;
 const CLIENT_PIN_GET_PIN_RETRIES: u8 = 0x01;
 const CLIENT_PIN_GET_KEY_AGREEMENT: u8 = 0x02;
 const CLIENT_PIN_GET_PIN_TOKEN: u8 = 0x05;
@@ -52,6 +72,7 @@ const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x09;
 // value only sizes the remaining attempts a platform is willing to offer.
 const DEFAULT_UV_RETRIES: u8 = 8;
 const CTAP2_OK: u8 = 0x00;
+const CTAP1_ERR_INVALID_COMMAND: u8 = 0x01;
 const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
 const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
 const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x33;
@@ -336,7 +357,15 @@ impl FidoClient {
     #[cfg(any(target_os = "linux", windows))]
     fn handle_remote_message(&mut self, mut message: CtapMessage) -> Result<()> {
         debug!("Remote session sent {}", describe_message(&message, true));
-        if message.command != CTAPHID_CBOR || message.payload.is_empty() {
+        if let Some(refusal) = refuse_remote_message(&message) {
+            warn!(
+                "Refused a remote FIDO request outside the allowlist: {}",
+                describe_message(&message, true)
+            );
+            self.output.extend(fragment_message(&refusal)?);
+            return Ok(());
+        }
+        if message.command != CTAPHID_CBOR {
             debug!("Forwarding the message to the authenticator untouched");
             return self.write_message(&message);
         }
@@ -799,6 +828,69 @@ impl CtapAssembler {
     }
 }
 
+/// CTAPHID transport commands the remote session may send to the physical
+/// authenticator. Everything else is answered locally with an error:
+/// - LOCK would let the session hold the authenticator for itself;
+/// - KEEPALIVE and ERROR only flow from the authenticator to the platform;
+/// - vendor commands (0x40 to 0x7f) reach the firmware configuration (ykman
+///   writes the enabled USB applications that way).
+///
+/// MSG (U2F) stays allowed: U2F has no destructive command, only register and
+/// authenticate with a touch, and platforms fall back to it for the `appid`
+/// extension.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn remote_ctaphid_command_allowed(command: u8) -> bool {
+    matches!(
+        command,
+        CTAPHID_PING | CTAPHID_MSG | CTAPHID_INIT | CTAPHID_WINK | CTAPHID_CBOR | CTAPHID_CANCEL
+    )
+}
+
+/// CTAP2 (CBOR) commands the remote session may use: what a browser needs to
+/// register and use a credential. Reset (wipes every credential of the key
+/// after a touch), Config, CredentialManagement, BioEnrollment, LargeBlobs and
+/// the vendor and prototype commands (0x40 and above) are refused locally:
+/// they manage the authenticator, which is the job of the workstation, not of
+/// a remote session.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn remote_ctap_command_allowed(command: u8) -> bool {
+    matches!(
+        command,
+        CTAP_MAKE_CREDENTIAL
+            | CTAP_GET_ASSERTION
+            | CTAP_GET_INFO
+            | CTAP_CLIENT_PIN
+            | CTAP_GET_NEXT_ASSERTION
+            | CTAP_SELECTION
+    )
+}
+
+/// The local answer to a message of the remote session that must not reach
+/// the physical authenticator, or `None` if the message may go on.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn refuse_remote_message(message: &CtapMessage) -> Option<CtapMessage> {
+    let ctaphid_error = |code: u8| CtapMessage {
+        cid: message.cid,
+        command: CTAPHID_ERROR,
+        payload: vec![code],
+    };
+    if !remote_ctaphid_command_allowed(message.command) {
+        return Some(ctaphid_error(CTAPHID_ERR_INVALID_CMD));
+    }
+    if message.command != CTAPHID_CBOR {
+        return None;
+    }
+    match message.payload.first() {
+        None => Some(ctaphid_error(CTAPHID_ERR_INVALID_LEN)),
+        Some(&command) if !remote_ctap_command_allowed(command) => Some(CtapMessage {
+            cid: message.cid,
+            command: CTAPHID_CBOR,
+            payload: ctap_error(CTAP1_ERR_INVALID_COMMAND),
+        }),
+        Some(_) => None,
+    }
+}
+
 fn fragment_message(message: &CtapMessage) -> Result<Vec<Vec<u8>>> {
     if message.payload.len() > MAX_CTAPHID_PAYLOAD || message.payload.len() > u16::MAX as usize {
         return Err(anyhow!("CTAPHID payload is too large"));
@@ -865,15 +957,15 @@ fn write_hid_report(device: &hidapi::HidDevice, report: &[u8]) -> Result<()> {
 #[cfg(any(target_os = "linux", windows))]
 fn ctaphid_command_name(command: u8) -> &'static str {
     match command {
-        0x03 => "MSG",
-        0x08 => "WINK",
-        0x0c => "LOCK",
+        CTAPHID_PING => "PING",
+        CTAPHID_MSG => "MSG",
+        CTAPHID_LOCK => "LOCK",
         CTAPHID_INIT => "INIT",
+        CTAPHID_WINK => "WINK",
         CTAPHID_CBOR => "CBOR",
-        0x11 => "KEEPALIVE",
-        0x3b => "PING",
-        0x3e => "CANCEL",
-        0x3f => "ERROR",
+        CTAPHID_CANCEL => "CANCEL",
+        CTAPHID_KEEPALIVE => "KEEPALIVE",
+        CTAPHID_ERROR => "ERROR",
         _ => "vendor/unknown",
     }
 }
@@ -885,13 +977,13 @@ fn ctap_command_name(command: u8) -> &'static str {
         CTAP_GET_ASSERTION => "GetAssertion",
         CTAP_GET_INFO => "GetInfo",
         CTAP_CLIENT_PIN => "ClientPIN",
-        0x07 => "Reset",
-        0x08 => "GetNextAssertion",
-        0x09 => "BioEnrollment",
-        0x0a => "CredentialManagement",
-        0x0b => "Selection",
-        0x0c => "LargeBlobs",
-        0x0d => "Config",
+        CTAP_RESET => "Reset",
+        CTAP_GET_NEXT_ASSERTION => "GetNextAssertion",
+        CTAP_BIO_ENROLLMENT => "BioEnrollment",
+        CTAP_CREDENTIAL_MANAGEMENT => "CredentialManagement",
+        CTAP_SELECTION => "Selection",
+        CTAP_LARGE_BLOBS => "LargeBlobs",
+        CTAP_CONFIG => "Config",
         _ => "unknown",
     }
 }
@@ -1343,6 +1435,18 @@ fn restrict_to_es256(info: &mut BTreeMap<Value, Value>) {
     );
 }
 
+/// GetInfo options of the management commands the remote session cannot
+/// use (CredentialManagement, Config, BioEnrollment, LargeBlobs).
+const HIDDEN_MANAGEMENT_OPTIONS: &[&str] = &[
+    "credMgmt",
+    "credentialMgmtPreview",
+    "authnrCfg",
+    "bioEnroll",
+    "userVerificationMgmtPreview",
+    "largeBlobs",
+    "setMinPINLength",
+];
+
 fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
@@ -1377,6 +1481,17 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result
     // remote PIN-setup UI in platform implementations.
     options.remove(&Value::Text("clientPin".to_owned()));
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
+    // The management commands are refused by remote_ctap_command_allowed:
+    // advertising them would only make the platform try and fail.
+    for option in HIDDEN_MANAGEMENT_OPTIONS {
+        options.remove(&Value::Text((*option).to_owned()));
+    }
+    // maxSerializedLargeBlobArray, and the extension that relies on the
+    // LargeBlobs command.
+    info.remove(&Value::Integer(11));
+    if let Some(Value::Array(extensions)) = info.get_mut(&Value::Integer(2)) {
+        extensions.retain(|extension| extension != &Value::Text("largeBlobKey".to_owned()));
+    }
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
     // forcePINChange and minPINLength describe the Client PIN feature. Leaving
     // them in place while `clientPin` is hidden makes the answer contradict
@@ -2031,6 +2146,120 @@ mod tests {
         // The Client PIN policy must not outlive the Client PIN option.
         assert_eq!(info.get(&Value::Integer(12)), None);
         assert_eq!(info.get(&Value::Integer(13)), None);
+    }
+
+    #[test]
+    fn get_info_hides_the_management_commands() {
+        let options = BTreeMap::from([
+            (Value::Text("credMgmt".to_owned()), Value::Bool(true)),
+            (Value::Text("authnrCfg".to_owned()), Value::Bool(true)),
+            (Value::Text("largeBlobs".to_owned()), Value::Bool(true)),
+            (Value::Text("rk".to_owned()), Value::Bool(true)),
+        ]);
+        let mut payload = ctap_success(map_of([
+            (1, Value::Array(vec![Value::Text("FIDO_2_1".to_owned())])),
+            (
+                2,
+                Value::Array(vec![
+                    Value::Text("credProtect".to_owned()),
+                    Value::Text("largeBlobKey".to_owned()),
+                ]),
+            ),
+            (4, Value::Map(options)),
+            (11, Value::Integer(1024)),
+        ]))
+        .unwrap();
+        advertise_local_pin_broker(&mut payload, false).unwrap();
+        let info = successful_map(&payload, "test").unwrap();
+        let Value::Map(options) = map_value(&info, 4).unwrap() else {
+            panic!("options should be a map");
+        };
+        for hidden in ["credMgmt", "authnrCfg", "largeBlobs"] {
+            assert_eq!(options.get(&Value::Text(hidden.to_owned())), None);
+        }
+        assert_eq!(
+            options.get(&Value::Text("rk".to_owned())),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(info.get(&Value::Integer(11)), None);
+        assert_eq!(
+            map_value(&info, 2).unwrap(),
+            &Value::Array(vec![Value::Text("credProtect".to_owned())])
+        );
+    }
+
+    fn remote(command: u8, payload: Vec<u8>) -> CtapMessage {
+        CtapMessage {
+            cid: 0x0102_0304,
+            command,
+            payload,
+        }
+    }
+
+    #[test]
+    fn relays_the_commands_a_browser_needs() {
+        for command in [
+            CTAPHID_PING,
+            CTAPHID_MSG,
+            CTAPHID_INIT,
+            CTAPHID_WINK,
+            CTAPHID_CANCEL,
+        ] {
+            assert_eq!(refuse_remote_message(&remote(command, vec![0; 8])), None);
+        }
+        for ctap in [
+            CTAP_MAKE_CREDENTIAL,
+            CTAP_GET_ASSERTION,
+            CTAP_GET_INFO,
+            CTAP_CLIENT_PIN,
+            CTAP_GET_NEXT_ASSERTION,
+            CTAP_SELECTION,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(CTAPHID_CBOR, vec![ctap, 0xa0])),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_the_management_and_vendor_commands_locally() {
+        // Regression for sanzu-fido-relay-unfiltered-commands: none of these
+        // may reach the physical authenticator.
+        for ctap in [
+            CTAP_RESET,
+            CTAP_BIO_ENROLLMENT,
+            CTAP_CREDENTIAL_MANAGEMENT,
+            CTAP_LARGE_BLOBS,
+            CTAP_CONFIG,
+            0x40,
+            0x41,
+            0xff,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(CTAPHID_CBOR, vec![ctap])),
+                Some(remote(CTAPHID_CBOR, vec![CTAP1_ERR_INVALID_COMMAND])),
+                "CTAP command 0x{ctap:02x}"
+            );
+        }
+        for command in [
+            CTAPHID_LOCK,
+            CTAPHID_KEEPALIVE,
+            CTAPHID_ERROR,
+            0x40,
+            0x50,
+            0x7f,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(command, vec![0x00])),
+                Some(remote(CTAPHID_ERROR, vec![CTAPHID_ERR_INVALID_CMD])),
+                "CTAPHID command 0x{command:02x}"
+            );
+        }
+        assert_eq!(
+            refuse_remote_message(&remote(CTAPHID_CBOR, vec![])),
+            Some(remote(CTAPHID_ERROR, vec![CTAPHID_ERR_INVALID_LEN]))
+        );
     }
 
     #[test]

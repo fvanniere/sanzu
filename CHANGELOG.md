@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   certificate of the chain sent by the client. A client could append a
   self-signed certificate naming another account and log in as that account.
   Chains longer than 4 certificates are refused.
+- FIDO relay: allowlist of the commands the remote session may send to the
+  workstation authenticator. CTAPHID PING, MSG, INIT, WINK, CBOR and CANCEL
+  pass; LOCK and the vendor commands (0x40-0x7f) get a CTAPHID error. CTAP2
+  MakeCredential, GetAssertion, GetNextAssertion, GetInfo, ClientPIN and
+  Selection pass; Reset, Config, CredentialManagement, BioEnrollment,
+  LargeBlobs and the vendor commands are answered locally with
+  `CTAP1_ERR_INVALID_COMMAND`. GetInfo no longer advertises these features.
+
+### Fixed
+- FIDO traces: the CTAPHID command names (PING, LOCK, CANCEL, KEEPALIVE) used
+  wrong codes.
 
 ## [0.2.17] - 2026-10-23
 
