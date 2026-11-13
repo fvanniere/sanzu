@@ -25,9 +25,8 @@ use nix::{
 use sanzu_common::{
     auth_pam::do_pam_auth,
     proto::{recv_client_msg_or_error, recv_server_msg_or_error, Tunnel, VERSION},
-    tls_helper::{get_subj_alt_names, make_server_config, tls_do_handshake},
+    tls_helper::{client_username_from_peer_certs, make_server_config, tls_do_handshake},
     tunnel,
-    utils::get_username_from_principal,
 };
 
 #[cfg(all(unix, feature = "kerberos"))]
@@ -43,7 +42,6 @@ use std::{
 };
 
 use uuid::Uuid;
-use x509_parser::prelude::*;
 
 const DEFAULT_CONFIG: &str = "sanzu_broker.toml";
 const TOKEN_USERNAME: &str = "%USERNAME%";
@@ -89,23 +87,11 @@ fn auth_client(
     let mut username = None;
     if let Some(ref allowed_client_domains) = config.tls.allowed_client_domains {
         tls_do_handshake(&mut tls_conn, socket).context("Error in tls_do_handshake")?;
-        let certs = tls_conn.peer_certificates();
-        let certs = certs
-            .map(Ok)
-            .unwrap_or_else(|| Err(anyhow!("No cert from user")))?;
-        let cert = certs
-            .last()
-            .map(Ok)
-            .unwrap_or_else(|| Err(anyhow!("No cert from user")))?;
-        let (_data, cert) =
-            X509Certificate::from_der(&cert.0).context("Error in X509Certificate from der")?;
-
-        let subj_alt_name =
-            get_subj_alt_names(&cert).context("Error in get subject alternative name")?;
-        debug!("Alt name: {:?}", subj_alt_name);
-
-        let tls_username = get_username_from_principal(&subj_alt_name, allowed_client_domains)
-            .context("Principal doesnt match realm pattern")?;
+        let certs = tls_conn
+            .peer_certificates()
+            .ok_or_else(|| anyhow!("No cert from user"))?;
+        // Identity from the verified leaf only (sanzu-broker-mtls-last-cert)
+        let tls_username = client_username_from_peer_certs(certs, allowed_client_domains)?;
         info!("TLS authentication ok for user: {}", tls_username);
         username = Some(tls_username);
     };

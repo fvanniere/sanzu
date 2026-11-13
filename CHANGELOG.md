@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Broker and server: the TLS client identity is read from the leaf
+  certificate, the only one verified by rustls, instead of the last
+  certificate of the chain sent by the client. A client could append a
+  self-signed certificate naming another account and log in as that account.
+  Chains longer than 4 certificates are refused.
+
 ## [0.2.17] - 2026-10-23
 
 ### Changed
