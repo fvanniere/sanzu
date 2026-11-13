@@ -34,10 +34,22 @@ package:debian:trixie:
     - cargo deb --version >/dev/null 2>&1 || cargo install cargo-deb --version 2.9.2 --locked
   script:
     - mkdir -p "${DEBIAN_PACKAGE_DIR}"
-    - cargo deb --locked -p sanzu
-    - cargo deb --locked -p sanzu --variant=client
-    - cargo deb --locked -p sanzu_broker
-    - cargo deb --locked -p sanzu-web
+    # Each build of main is published and installed automatically: it needs
+    # its own, increasing Debian revision (1+git<pipeline iid> sorts after the
+    # -1 of the release and after the previous build of main). Release tags
+    # keep -1.
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        DEB_REVISION="1"
+      else
+        DEB_REVISION="1+git${CI_PIPELINE_IID}"
+      fi
+      echo "Debian revision: ${DEB_REVISION}"
+      echo "DEB_REVISION=${DEB_REVISION}" > deb-revision.env
+    - cargo deb --locked -p sanzu --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu --variant=client --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu_broker --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu-web --deb-revision "${DEB_REVISION}"
     - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
     - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 4
     - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
@@ -46,6 +58,8 @@ package:debian:trixie:
     name: "sanzu-debian-trixie-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/debian-trixie/*.deb
+    reports:
+      dotenv: deb-revision.env
     expire_in: 30 days
   rules:
     - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
@@ -69,10 +83,13 @@ publish:debian:trixie:
     - |
       if [ -n "${CI_COMMIT_TAG}" ]; then
         test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
+        test "${DEB_REVISION}" = "1"
         REGISTRY_VERSION="${PACKAGE_VERSION}"
       else
         test "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}"
-        REGISTRY_VERSION="${PACKAGE_VERSION}-${CI_COMMIT_SHORT_SHA}"
+        test "${DEB_REVISION}" = "1+git${CI_PIPELINE_IID}"
+        # Same version as the Debian packages it holds, never reused.
+        REGISTRY_VERSION="${PACKAGE_VERSION}-${DEB_REVISION}"
       fi
       export REGISTRY_VERSION
     - |

@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Broker and server: the TLS client identity is read from the leaf
+  certificate, the only one verified by rustls, instead of the last
+  certificate of the chain sent by the client. A client could append a
+  self-signed certificate naming another account and log in as that account.
+  Chains longer than 4 certificates are refused.
+- FIDO relay: allowlist of the commands the remote session may send to the
+  workstation authenticator. CTAPHID PING, MSG, INIT, WINK, CBOR and CANCEL
+  pass; LOCK and the vendor commands (0x40-0x7f) get a CTAPHID error. CTAP2
+  MakeCredential, GetAssertion, GetNextAssertion, GetInfo, ClientPIN and
+  Selection pass; Reset, Config, CredentialManagement, BioEnrollment,
+  LargeBlobs and the vendor commands are answered locally with
+  `CTAP1_ERR_INVALID_COMMAND`. GetInfo no longer advertises these features.
+- Server (Linux): the X server joined through `DISPLAY` must run as the uid
+  of `sanzu_server` (or root), checked with `SO_PEERCRED` on the socket.
+  x11rb tries the abstract socket `@/tmp/.X11-unix/X<n>` first, which any
+  process of the network namespace may create: another account squatting a
+  free display would otherwise receive the MIT cookie and the input events.
+
+### Changed
+- CI: each build of `main` gets its own Debian revision, `1+git<pipeline
+  iid>`, and is published under the registry version
+  `<version>-1+git<pipeline iid>`. Every commit of main was published as
+  `<version>-1`, which the lab repository refused as a duplicate. Release tags
+  keep the `-1` revision.
+
+### Fixed
+- FIDO traces: the CTAPHID command names (PING, LOCK, CANCEL, KEEPALIVE) used
+  wrong codes.
+
 ## [0.2.17] - 2026-10-23
 
 ### Changed
