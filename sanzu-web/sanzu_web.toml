@@ -1,0 +1,31 @@
+# Plain http on localhost for a test only: in production listen on
+# 127.0.0.1 behind an HTTPS reverse proxy, and keep secure_cookie = true
+listen = "127.0.0.1:8080"
+# Origin the browsers use; the WebSocket and the login form must come from it
+public_origin = "http://localhost:8080"
+secure_cookie = false
+# Seconds a login stays valid
+session_lifetime = 43200
+
+# Login / password form, checked by this PAM service
+[pam]
+service = "login"
+
+# OpenID Connect (authorization code + PKCE), optional
+# [oidc]
+# issuer = "https://idp.example.org/realms/main"
+# client_id = "sanzu-web"
+# client_secret = "change-me"
+# redirect_uri = "https://sanzu.example.org/oidc/callback"
+# scopes = ["openid", "profile"]
+# # ID token claim holding the local user name
+# username_claim = "preferred_username"
+# label = "Log in with Keycloak"
+
+# Same callback as sanzu_broker: start a sanzu server for the user, which
+# connects back to the unix socket (sanzu_server --unixsock --connect-unixsock
+# --address %UNIX_SOCK_PATH%), then return. Browsers decode H.264 4:2:0 only:
+# that server needs pixel_format = "yuv420p".
+[cmd_callback.on_connect]
+command_bin = "/usr/local/bin/sanzu-web-session"
+command_args = ["%USERNAME%", "%UNIX_SOCK_PATH%"]

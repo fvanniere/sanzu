@@ -3,6 +3,26 @@ use sanzu_common::tunnel;
 use anyhow::Result;
 use std::{cmp::Ordering, collections::HashMap};
 
+/// X11 keycodes used to detect the paste shortcuts (Ctrl+V, Shift+Insert)
+const KEY_CTRL_L: usize = 37;
+const KEY_CTRL_R: usize = 105;
+const KEY_SHIFT_L: usize = 50;
+const KEY_SHIFT_R: usize = 62;
+const KEY_ALT_L: usize = 64;
+const KEY_ALT_R: usize = 108;
+const KEY_V: usize = 55;
+const KEY_INSERT: usize = 118;
+
+/// Returns true if `keycode`, pressed along with the keys of `keys_state`, is a
+/// paste shortcut: Ctrl+V (Ctrl+Shift+V in terminals) or Shift+Insert
+pub fn is_paste_shortcut(keys_state: &[bool], keycode: usize) -> bool {
+    let pressed = |key: usize| keys_state.get(key).copied().unwrap_or(false);
+    let ctrl = pressed(KEY_CTRL_L) || pressed(KEY_CTRL_R);
+    let shift = pressed(KEY_SHIFT_L) || pressed(KEY_SHIFT_R);
+    let alt = pressed(KEY_ALT_L) || pressed(KEY_ALT_R);
+    !alt && ((ctrl && keycode == KEY_V) || (shift && !ctrl && keycode == KEY_INSERT))
+}
+
 /// Holds information on a server side window.
 ///
 /// TODO: for now, we only support rectangle windows.
@@ -118,6 +138,38 @@ pub trait Client {
 
     fn display_stats(&self) -> bool;
 
+    /// In clipboard trig mode, returns true (once) if the user pasted while the
+    /// local clipboard has not been sent with Ctrl+Alt+Shift+C or V
+    fn clipboard_warning(&mut self) -> bool;
+
     /// Callback to print file
     fn printfile(&self, file: &str) -> Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(pressed: &[usize]) -> Vec<bool> {
+        let mut keys_state = vec![false; 0x100];
+        for key in pressed {
+            keys_state[*key] = true;
+        }
+        keys_state
+    }
+
+    #[test]
+    fn paste_shortcuts() {
+        assert!(is_paste_shortcut(&keys(&[KEY_CTRL_L]), KEY_V));
+        assert!(is_paste_shortcut(&keys(&[KEY_CTRL_R, KEY_SHIFT_L]), KEY_V));
+        assert!(is_paste_shortcut(&keys(&[KEY_SHIFT_R]), KEY_INSERT));
+        assert!(!is_paste_shortcut(&keys(&[]), KEY_V));
+        assert!(!is_paste_shortcut(&keys(&[]), KEY_INSERT));
+        assert!(!is_paste_shortcut(&keys(&[KEY_CTRL_L]), KEY_INSERT));
+        // Ctrl+Alt+Shift shortcuts are local to the client
+        assert!(!is_paste_shortcut(
+            &keys(&[KEY_CTRL_L, KEY_SHIFT_L, KEY_ALT_L]),
+            KEY_V
+        ));
+    }
 }

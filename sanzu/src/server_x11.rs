@@ -39,6 +39,15 @@ use utils_x11::{get_clipboard_events, listen_clipboard};
 use x11_clipboard::Clipboard;
 
 const PATH_PCI_DEVICES: &str = "/sys/bus/pci/devices/";
+const CAPTURE_SHM_PERMISSIONS: libc::c_int = 0o600;
+
+#[cfg(test)]
+mod shm_security_tests {
+    #[test]
+    fn capture_is_readable_and_writable_only_by_its_owner() {
+        assert_eq!(super::CAPTURE_SHM_PERMISSIONS, 0o600);
+    }
+}
 
 use x11rb::{
     connection::{Connection, RequestConnection},
@@ -186,7 +195,13 @@ fn init_grab<C: Connection>(
 
     // Video is exported via tcp / vsock
     let shmid = unsafe {
-        let ret = shmget(libc::IPC_PRIVATE, size, libc::IPC_CREAT | 0o777);
+        // Xvfb and the encoder run as the same user. IPC_PRIVATE allocates a
+        // new segment; it does not prevent other UIDs from attaching to it.
+        let ret = shmget(
+            libc::IPC_PRIVATE,
+            size,
+            libc::IPC_CREAT | CAPTURE_SHM_PERMISSIONS,
+        );
         if ret < 0 {
             return Err(anyhow!("Error in shmget"));
         }
@@ -705,6 +720,109 @@ fn del_custom_video_mode<C: Connection>(conn: &C, window: Window) -> Result<()> 
     Ok(())
 }
 
+/// Whether an X server whose socket belongs to `peer_uid` may be used by a
+/// process running as `own_uid`: our own server, or root's (root can read our
+/// memory anyway, so it is no new trust).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn x11_server_owner_allowed(peer_uid: u32, own_uid: u32) -> bool {
+    peer_uid == own_uid || peer_uid == 0
+}
+
+/// Check that the X server at the other end of `fd` runs under our own UID.
+///
+/// The X11 client authenticates to the server with its MIT cookie, but nothing
+/// authenticates the server. x11rb, like libxcb, first tries the abstract
+/// socket `@/tmp/.X11-unix/X<n>`, which any process of the network namespace
+/// can create without access control. When the display of an account is free
+/// (session restart, crash), another account could listen there and receive
+/// our cookie, our keystrokes and the clipboard (audit run-2,
+/// sanzu-session-x11-display-squat). The kernel records the credentials of the
+/// listening process on the socket: SO_PEERCRED gives them back.
+///
+/// Only local (AF_UNIX) connections are checked; a TCP display has no such
+/// credentials and is only logged.
+#[cfg(target_os = "linux")]
+fn check_x11_server_owner(fd: std::os::unix::io::RawFd) -> Result<()> {
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the buffer and its length describe a valid sockaddr_storage.
+    let ret = unsafe {
+        libc::getsockname(
+            fd,
+            &mut address as *mut libc::sockaddr_storage as *mut libc::sockaddr,
+            &mut address_len,
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "Cannot read the X11 socket address: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if address.ss_family as libc::c_int != libc::AF_UNIX {
+        warn!("The X11 display is not a local socket: its owner cannot be checked");
+        return Ok(());
+    }
+
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut credentials_len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: the buffer and its length describe a valid ucred.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut credentials_len,
+        )
+    };
+    if ret != 0 {
+        return Err(anyhow!(
+            "Cannot read the credentials of the X11 server: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: getuid cannot fail.
+    let own_uid = unsafe { libc::getuid() };
+    if !x11_server_owner_allowed(credentials.uid, own_uid) {
+        return Err(anyhow!(
+            "The X11 server (pid {}) runs as uid {}, not as uid {}",
+            credentials.pid,
+            credentials.uid,
+            own_uid
+        ));
+    }
+    debug!(
+        "X11 server pid {} runs as uid {}",
+        credentials.pid, credentials.uid
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod x11_server_owner_tests {
+    use super::*;
+
+    #[test]
+    fn only_our_own_or_root_x_server_is_accepted() {
+        assert!(x11_server_owner_allowed(1000, 1000));
+        assert!(x11_server_owner_allowed(0, 1000));
+        assert!(!x11_server_owner_allowed(1001, 1000));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accepts_a_local_peer_of_our_own_uid() {
+        use std::os::unix::io::AsRawFd;
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        check_x11_server_owner(left.as_raw_fd()).unwrap();
+    }
+}
+
 /// Initialize x11rb server handler
 pub fn init_x11rb(
     arguments: &ServerArgsConfig,
@@ -722,6 +840,11 @@ pub fn init_x11rb(
                 err
             })
         {
+            // Fail closed: another account squatting the display must not
+            // receive our cookie and our input events.
+            #[cfg(target_os = "linux")]
+            check_x11_server_owner(std::os::unix::io::AsRawFd::as_raw_fd(conn.stream()))
+                .context("Refusing the X11 server")?;
             break Ok((conn, screen_num));
         }
         sleep(Duration::from_millis(100));

@@ -104,6 +104,43 @@ This option only gates the client-to-server direction. Server-to-client
 clipboard updates remain automatic; start the server with
 `--restrict-clipboard` to disable that direction.
 
+### Multiple monitors (X11)
+
+By default the client spans the whole X11 screen and the window manager decides
+where its fullscreen window lands. `--monitor` opens it on one monitor, named by
+its index in `xrandr --listmonitors` or by its output name:
+
+```
+./sanzu_client 192.168.0.1 1122 --monitor 1
+./sanzu_client 192.168.0.1 1122 --monitor HDMI-A-1
+```
+
+Ctrl+Alt+Shift+N moves the client to the next monitor, fullscreen included: the
+window manager cannot move a fullscreen window itself. The window has the
+`WM_CLASS` `sanzu_client`/`Sanzu`, so KWin and other window managers can match it
+in their window rules.
+
+### Wayland (prototype)
+
+On Linux the client picks its display backend with `--backend`:
+
+- `auto` (default): native Wayland when `WAYLAND_DISPLAY` is set, else X11. If
+  the Wayland client cannot start and `DISPLAY` is set, it falls back to X11.
+- `wayland`: native Wayland only.
+- `x11`: X11, which in a Wayland session runs through XWayland.
+
+The Wayland client keeps the seamless mode: one fullscreen surface, transparent
+and click-through outside the remote windows. It needs `wp_viewporter`, which
+scales the remote frame to the surface: `--zoom` and fractional output scales
+(`wp_fractional_scale_v1`, 125 %, 150 %... under KDE) cost no CPU. `--monitor`
+takes the output name (`DP-1`, `HDMI-A-1`...); an index follows the compositor
+order, not `xrandr`. Ctrl+Alt+Shift+N moves the fullscreen client to the next
+output. `--grab-keyboard` uses `zwp_keyboard_shortcuts_inhibit_v1` to keep the
+compositor shortcuts away. The window has the app id `sanzu_client`.
+
+Not yet handled: the primary selection (middle click paste), Scroll Lock
+synchronisation, and a cursor scaled to the output.
+
 ### FIDO2 / YubiKey forwarding
 
 A Linux or Windows client can expose the FIDO interface of a local YubiKey (or

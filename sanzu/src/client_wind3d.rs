@@ -1,5 +1,5 @@
 use crate::{
-    client_utils::{Area, Client},
+    client_utils::{is_paste_shortcut, Area, Client},
     utils::{ClientArgsConfig, ClipboardConfig},
     utils_win,
 };
@@ -83,6 +83,7 @@ lazy_static! {
     static ref KEYS_STATE: Mutex<Vec<bool>> = Mutex::new(vec![false; 0x100]);
     static ref DISPLAY_STATS: atomic::AtomicBool = atomic::AtomicBool::new(false);
     static ref CLIPBOARD_TRIG: atomic::AtomicBool = atomic::AtomicBool::new(false);
+    static ref CLIPBOARD_PASTE: atomic::AtomicBool = atomic::AtomicBool::new(false);
     static ref WINDOW_RECEIVER: Mutex<Option<Receiver<AreaManager>>> = Mutex::new(None);
     static ref WINDOW_SENDER: Mutex<Option<Sender<AreaManager>>> = Mutex::new(None);
     static ref MSG_SENDER: Mutex<Option<Sender<u64>>> = Mutex::new(None);
@@ -98,6 +99,7 @@ const KEY_SHIFT: usize = 50;
 const KEY_ALT: usize = 64;
 const KEY_S: usize = 39;
 const KEY_C: usize = 54;
+const KEY_V: usize = 55;
 
 const WM_UPDATE_FRAME: UINT = WM_USER + 1;
 const WM_WTSSESSION_CHANGE: DWORD = 0x2B1;
@@ -236,6 +238,10 @@ pub struct ClientWindows {
     pub height: u16,
     pub clipboard_config: ClipboardConfig,
     pub clipboard_last_value: Option<String>,
+    /// The last seen clipboard value has not been sent to the server
+    pub clipboard_pending: bool,
+    /// The user pasted without sending the clipboard
+    pub clipboard_warning: bool,
     pub printdir: Option<String>,
     /// Sync caps/num/scroll lock
     pub sync_key_locks: bool,
@@ -290,6 +296,8 @@ impl ClientWindows {
             height,
             clipboard_config,
             clipboard_last_value: None,
+            clipboard_pending: false,
+            clipboard_warning: false,
             printdir,
             sync_key_locks,
         };
@@ -770,13 +778,17 @@ extern "system" fn custom_wnd_proc(
                     }
                 }
 
-                // If Ctrl alt shift c => Trig clipboard event
-                if keycode == KEY_C as u16 && updown {
+                // If Ctrl alt shift c or v => Trig clipboard event
+                if (keycode == KEY_C as u16 || keycode == KEY_V as u16) && updown {
                     // Ctrl Shift Alt
                     let keys_state = KEYS_STATE.lock().unwrap();
                     if keys_state[KEY_CTRL] && keys_state[KEY_SHIFT] && keys_state[KEY_ALT] {
                         CLIPBOARD_TRIG.store(true, atomic::Ordering::Release);
                     }
+                }
+
+                if updown && is_paste_shortcut(&KEYS_STATE.lock().unwrap(), keycode as usize) {
+                    CLIPBOARD_PASTE.store(true, atomic::Ordering::Release);
                 }
 
                 let msg_event = tunnel::MessageClient {
@@ -1641,6 +1653,8 @@ impl Client for ClientWindows {
     }
 
     fn set_clipboard(&mut self, data: &str) -> Result<()> {
+        // The local clipboard now matches the remote one
+        self.clipboard_pending = false;
         *SKIP_CLIPBOARD.lock().unwrap() += 1;
         set_clipboard(formats::Unicode, data)
             .map_err(|err| anyhow!("Err {:?}", err))
@@ -1688,6 +1702,7 @@ impl Client for ClientWindows {
                         Some(tunnel::message_client::Msg::Clipboard(tunnel::EventClipboard { data })),
                 } => {
                     self.clipboard_last_value = Some(data);
+                    self.clipboard_pending = true;
                 }
                 event @ tunnel::MessageClient {
                     msg: Some(tunnel::message_client::Msg::Display(_)),
@@ -1708,6 +1723,7 @@ impl Client for ClientWindows {
             events.push(event)
         }
 
+        let clipboard_paste = CLIPBOARD_PASTE.swap(false, atomic::Ordering::AcqRel);
         match self.clipboard_config {
             ClipboardConfig::Deny => {}
 
@@ -1734,8 +1750,12 @@ impl Client for ClientWindows {
                         msg: Some(tunnel::message_client::Msg::Clipboard(eventclipboard)),
                     };
                     events.push(clipboard_msg);
+                    self.clipboard_pending = false;
                 }
                 CLIPBOARD_TRIG.store(false, atomic::Ordering::Release);
+                if clipboard_paste && self.clipboard_pending {
+                    self.clipboard_warning = true;
+                }
             }
         }
 
@@ -1747,6 +1767,10 @@ impl Client for ClientWindows {
 
     fn display_stats(&self) -> bool {
         DISPLAY_STATS.load(atomic::Ordering::Acquire)
+    }
+
+    fn clipboard_warning(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_warning)
     }
 
     fn printfile(&self, file: &str) -> Result<()> {

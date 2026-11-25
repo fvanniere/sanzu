@@ -93,7 +93,7 @@ pub struct ServerArgsConfig {
         long,
         short = 'e',
         default_value = "libx264",
-        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc"
+        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc, libsvtav1, libvpx-vp9"
     )]
     pub encoder: String,
     #[clap(
@@ -248,12 +248,6 @@ pub struct ClientArgsConfig {
     #[clap(
         long,
         default_value_t = false,
-        help = "Forward the FIDO authenticator verbatim: no local PIN broker, no GetInfo rewrite. The remote session sees the raw authenticator and asks for the PIN itself"
-    )]
-    pub fido_passthrough: bool,
-    #[clap(
-        long,
-        default_value_t = false,
         help = "Advertise only ES256 in the forwarded GetInfo. Diagnostic for platforms whose CBOR parser rejects the authenticator's other algorithm identifiers"
     )]
     pub fido_es256_only: bool,
@@ -294,7 +288,7 @@ pub struct ClientArgsConfig {
         help = r#"Control clipboard behavior:
  - allow: send clipboard to server on local clipboard modification
  - deny: never send local clipboard to server
- - trig: send local clipboard to server on hitting special shortcut
+ - trig: send local clipboard to server on hitting Ctrl+Alt+Shift+C or Ctrl+Alt+Shift+V
 "#
     )]
     pub clipboard: String,
@@ -304,6 +298,25 @@ pub struct ClientArgsConfig {
         help = "Client will be in window mode instead of fullscreen"
     )]
     pub window_mode: bool,
+    #[cfg(unix)]
+    #[clap(
+        long,
+        help = r"Local monitor to open on: output name (DP-1, HDMI-A-1, ...) or index (0, 1, ...),
+as `xrandr --listmonitors` numbers them on X11, in compositor order on Wayland.
+Ctrl+Alt+Shift+N then moves the client to the next monitor"
+    )]
+    pub monitor: Option<String>,
+    #[cfg(target_os = "linux")]
+    #[clap(
+        long,
+        default_value = "auto",
+        help = r"Display backend:
+ - auto: Wayland when WAYLAND_DISPLAY is set, else X11
+ - wayland: native Wayland
+ - x11: X11, through XWayland in a Wayland session
+"
+    )]
+    pub backend: String,
     #[clap(
         long,
         default_value_t = 1.0,
@@ -417,7 +430,7 @@ pub struct ProxyArgsConfig {
         long,
         short = 'e',
         default_value = "libx264",
-        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc"
+        help = "Encoder name. Ex: libx264, h264_qsv, hevc_nvenc, libsvtav1, libvpx-vp9"
     )]
     pub encoder: String,
     #[clap(

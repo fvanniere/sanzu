@@ -1,7 +1,12 @@
 use anyhow::{Context, Result};
 extern crate libc;
 use memmap2::MmapOptions;
-use std::{collections::HashMap, fmt::Write as _, net::TcpStream, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    net::TcpStream,
+    time::{Duration, Instant},
+};
 
 use std::{
     convert::TryInto,
@@ -33,8 +38,26 @@ use crate::{
         get_xwd_data, ClientArgsConfig, HasTimeout, MAX_BYTES_PER_LINE, MAX_CURSOR_HEIGHT,
         MAX_CURSOR_WIDTH, MAX_WINDOW_HEIGHT, MAX_WINDOW_WIDTH,
     },
-    video_decoder::init_video_codec,
+    video_decoder::{default_decoder_name, init_video_codec},
 };
+
+/// Flash message shown when the user pastes in clipboard trig mode without
+/// sending the clipboard first
+const CLIPBOARD_WARNING: &str =
+    "Presse-papiers non envoyé : faites Ctrl+Alt+Shift+C avant de coller";
+const CLIPBOARD_WARNING_DURATION: Duration = Duration::from_secs(3);
+
+/// Draw the clipboard warning centered at the top of the `img_rgba` frame
+fn draw_clipboard_warning(img_rgba: &mut [u8], width: u16, height: u16) {
+    let mut display = TestDisplay {
+        width: width as u32,
+        height: height as u32,
+        buffer: img_rgba,
+    };
+    let text_width = 7 * CLIPBOARD_WARNING.chars().count() as i32;
+    let x = ((width as i32 - text_width) / 2).max(0);
+    draw_text(&mut display, CLIPBOARD_WARNING, x, 40);
+}
 
 struct ShellAttr {
     path: &'static str,
@@ -249,6 +272,39 @@ impl ClientInterface for StdioClientInterface {
 /// - decode and handle those events (image decoding, sound, notifications, clipboard, ...)
 /// - image update if necessary
 ///
+
+/// Pick the display backend: native Wayland in a Wayland session, unless
+/// `--backend x11` asks for X11 (XWayland there)
+#[cfg(target_os = "linux")]
+fn init_linux_graphics(
+    arguments: &ClientArgsConfig,
+    seamless: bool,
+    server_size: Option<(u16, u16)>,
+) -> Result<Box<dyn crate::client_utils::Client>> {
+    let init_x11 = || init_x11rb(arguments, seamless, server_size).context("Error in init_x11rb");
+    let init_wayland = || {
+        crate::client_wayland::init_wayland(arguments, seamless, server_size)
+            .context("Error in init_wayland")
+    };
+    match arguments.backend.as_str() {
+        "wayland" => init_wayland(),
+        "x11" => init_x11(),
+        "auto" => {
+            if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+                return init_x11();
+            }
+            match init_wayland() {
+                Ok(client) => Ok(client),
+                Err(err) if std::env::var_os("DISPLAY").is_some() => {
+                    warn!("Wayland client failed, falling back to X11: {:?}", err);
+                    init_x11()
+                }
+                Err(err) => Err(err),
+            }
+        }
+        backend => Err(anyhow!("Unknown display backend: {backend}")),
+    }
+}
 
 pub fn run(
     client_config: &ConfigClient,
@@ -509,7 +565,7 @@ pub fn do_run(
     let server_allows_fido = msg.fido;
     let codec_name = match &arguments.decoder {
         Some(decoder_name) => decoder_name.to_owned(),
-        None => msg.codec_name.to_owned(),
+        None => default_decoder_name(&msg.codec_name).to_owned(),
     };
     let (seamless, server_size) = match msg.msg {
         Some(tunnel::server_hello::Msg::AdaptScreen(adapt_screen)) => (adapt_screen.seamless, None),
@@ -535,12 +591,8 @@ pub fn do_run(
     }
     let mut fido = if fido_requested {
         Some(
-            FidoClient::open(
-                arguments.fido_device.as_deref(),
-                arguments.fido_passthrough,
-                arguments.fido_es256_only,
-            )
-            .map_err(|err| send_client_err_event(server, err))?,
+            FidoClient::open(arguments.fido_device.as_deref(), arguments.fido_es256_only)
+                .map_err(|err| send_client_err_event(server, err))?,
         )
     } else {
         None
@@ -551,7 +603,6 @@ pub fn do_run(
             client
                 .into_link(FidoReopen::new(
                     arguments.fido_device.clone(),
-                    arguments.fido_passthrough,
                     arguments.fido_es256_only,
                     info,
                 ))
@@ -560,7 +611,10 @@ pub fn do_run(
         _ => None,
     };
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    let mut client = init_linux_graphics(arguments, seamless, server_size)
+        .map_err(|err| send_client_err_event(server, err))?;
+    #[cfg(all(unix, not(target_os = "linux")))]
     let mut client = init_x11rb(arguments, seamless, server_size)
         .context("Error in init_x11rb")
         .map_err(|err| send_client_err_event(server, err))?;
@@ -612,12 +666,18 @@ pub fn do_run(
 
     let mut stats = "".to_owned();
     let mut img_bytes_per_line = None;
+    // End of the clipboard warning display, is it on screen, and the frame
+    // without it to restore
+    let mut clipboard_warning_until: Option<Instant> = None;
+    let mut clipboard_warning_displayed = false;
+    let mut frame_without_warning: Option<Vec<u8>> = None;
     loop {
         let mut areas = HashMap::new();
         let time_start = Instant::now();
 
         let display_size = client.size();
         let mut msgs = client.poll_events().context("Error in poll_events")?;
+        let clipboard_warning_new = client.clipboard_warning();
         let fido_stopped = match fido.as_mut() {
             Some(link) => match link.poll_reports() {
                 Ok(reports) => {
@@ -816,6 +876,13 @@ pub fn do_run(
         let time_decode_msgs = Instant::now();
         let mut time_decode = None;
 
+        if clipboard_warning_new {
+            clipboard_warning_until = Some(time_decode_msgs + CLIPBOARD_WARNING_DURATION);
+        } else if clipboard_warning_until.is_some_and(|until| time_decode_msgs >= until) {
+            clipboard_warning_until = None;
+        }
+        let warning_shown = clipboard_warning_until.is_some();
+
         if let Some((img_data, new_img_width, new_img_height)) = img_todo {
             if img_width != new_img_width as u16 || img_height != new_img_height as u16 {
                 info!("New resolution {}x{}", new_img_width, new_img_height);
@@ -842,17 +909,47 @@ pub fn do_run(
                         draw_text(&mut display, &stats, 0, img_height as i32 - 50);
                     }
 
+                    let img_rgba = &mut data_rgba[0..img_width as usize * img_height as usize * 4];
+                    if warning_shown {
+                        frame_without_warning = Some(img_rgba.to_vec());
+                        draw_clipboard_warning(img_rgba, img_width, img_height);
+                    } else {
+                        frame_without_warning = None;
+                    }
+                    clipboard_warning_displayed = warning_shown;
+
                     client
-                        .set_img(
-                            &data_rgba[0..img_width as usize * img_height as usize * 4],
-                            (img_width as u32, img_height as u32),
-                        )
+                        .set_img(img_rgba, (img_width as u32, img_height as u32))
                         .context("Error in set_img")?;
                 }
                 let time_set_img = Instant::now();
                 timings.times.push(("set", time_set_img - time_start));
                 time_decode = Some(timings);
             }
+        }
+
+        // No new frame displayed: add or remove the warning on the current one
+        if warning_shown != clipboard_warning_displayed {
+            let img_size = img_width as usize * img_height as usize * 4;
+            if warning_shown {
+                if let Some(data_rgba) = decoder.data_rgba().as_mut() {
+                    if data_rgba.len() >= img_size {
+                        let img_rgba = &mut data_rgba[0..img_size];
+                        frame_without_warning = Some(img_rgba.to_vec());
+                        draw_clipboard_warning(img_rgba, img_width, img_height);
+                        client
+                            .set_img(img_rgba, (img_width as u32, img_height as u32))
+                            .context("Error in set_img")?;
+                    }
+                }
+            } else if let Some(frame) = frame_without_warning.take() {
+                if frame.len() == img_size {
+                    client
+                        .set_img(&frame, (img_width as u32, img_height as u32))
+                        .context("Error in set_img")?;
+                }
+            }
+            clipboard_warning_displayed = warning_shown;
         }
 
         let display_size = client.size();

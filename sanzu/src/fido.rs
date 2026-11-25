@@ -32,22 +32,47 @@ pub const FIDO_REPORT_SIZE: usize = 64;
 const MAX_REPORTS_PER_CYCLE: usize = 64;
 const FIDO_USAGE_PAGE: u16 = 0xf1d0;
 const FIDO_USAGE: u16 = 0x0001;
-const CTAPHID_CBOR: u8 = 0x10;
+// CTAPHID transport commands (CTAP 2.1, 11.2.9). 0x40 to 0x7f are vendor
+// commands, used for instance by ykman to read and write the YubiKey
+// configuration through the FIDO interface.
+const CTAPHID_PING: u8 = 0x01;
+const CTAPHID_MSG: u8 = 0x03;
+const CTAPHID_LOCK: u8 = 0x04;
 const CTAPHID_INIT: u8 = 0x06;
+const CTAPHID_WINK: u8 = 0x08;
+const CTAPHID_CBOR: u8 = 0x10;
+const CTAPHID_CANCEL: u8 = 0x11;
+const CTAPHID_KEEPALIVE: u8 = 0x3b;
+const CTAPHID_ERROR: u8 = 0x3f;
+// CTAPHID_ERROR codes
+const CTAPHID_ERR_INVALID_CMD: u8 = 0x01;
+const CTAPHID_ERR_INVALID_LEN: u8 = 0x03;
 const CTAP_GET_INFO: u8 = 0x04;
 const CTAP_CLIENT_PIN: u8 = 0x06;
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_GET_ASSERTION: u8 = 0x02;
+const CTAP_RESET: u8 = 0x07;
+const CTAP_GET_NEXT_ASSERTION: u8 = 0x08;
+const CTAP_BIO_ENROLLMENT: u8 = 0x09;
+const CTAP_CREDENTIAL_MANAGEMENT: u8 = 0x0a;
+const CTAP_SELECTION: u8 = 0x0b;
+const CTAP_LARGE_BLOBS: u8 = 0x0c;
+const CTAP_CONFIG: u8 = 0x0d;
 const CLIENT_PIN_GET_PIN_RETRIES: u8 = 0x01;
 const CLIENT_PIN_GET_KEY_AGREEMENT: u8 = 0x02;
 const CLIENT_PIN_GET_PIN_TOKEN: u8 = 0x05;
-const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x06;
+// CTAP 2.1, authenticatorClientPIN: 0x06 is getPinUvAuthTokenUsingUvWithPermissions
+// and 0x09 getPinUvAuthTokenUsingPinWithPermissions. Both used to be named the
+// other way round; they reach the same local prompt, so only names and logs
+// were wrong.
+const CLIENT_PIN_TOKEN_USING_UV: u8 = 0x06;
 const CLIENT_PIN_GET_UV_RETRIES: u8 = 0x07;
-const CLIENT_PIN_TOKEN_USING_UV: u8 = 0x09;
+const CLIENT_PIN_TOKEN_USING_PIN: u8 = 0x09;
 // Reported when the authenticator refuses to disclose its own counter; the
 // value only sizes the remaining attempts a platform is willing to offer.
 const DEFAULT_UV_RETRIES: u8 = 8;
 const CTAP2_OK: u8 = 0x00;
+const CTAP1_ERR_INVALID_COMMAND: u8 = 0x01;
 const CTAP2_ERR_OPERATION_DENIED: u8 = 0x27;
 const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
 const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x33;
@@ -56,6 +81,10 @@ const PIN_PERMISSION_MAKE_CREDENTIAL: u8 = 0x01;
 const PIN_PERMISSION_GET_ASSERTION: u8 = 0x02;
 const PIN_TOKEN_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_CTAPHID_PAYLOAD: usize = 4096;
+/// Upper bound of what pinentry writes back: a few Assuan status lines and the
+/// `D ` line. A PIN is at most 63 bytes, 189 once percent-escaped.
+#[cfg(target_os = "linux")]
+const PINENTRY_OUTPUT_LIMIT: usize = 4096;
 
 #[derive(Debug, PartialEq)]
 enum FidoSelector<'a> {
@@ -119,12 +148,6 @@ pub struct FidoClient {
     pending_get_info: HashSet<u32>,
     proxy_secret: SecretKey,
     pin_session: Option<PinSession>,
-    /// Forward everything untouched: no GetInfo rewrite, no ClientPIN broker,
-    /// no proof translation. The remote session then talks to the raw
-    /// authenticator and prompts for the PIN itself, which is what this
-    /// forwarding did before the local broker existed. Kept as a diagnostic:
-    /// it isolates the broker from the rest of the path in one flag.
-    passthrough: bool,
     /// Trim the advertised algorithm list down to ES256. Some platform CBOR
     /// parsers reject a GetInfo whose algorithm identifiers they do not all
     /// recognize, and refuse the authenticator before sending any command.
@@ -132,7 +155,7 @@ pub struct FidoClient {
 }
 
 impl FidoClient {
-    pub fn open(requested_path: Option<&str>, passthrough: bool, es256_only: bool) -> Result<Self> {
+    pub fn open(requested_path: Option<&str>, es256_only: bool) -> Result<Self> {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
@@ -239,16 +262,8 @@ impl FidoClient {
                 .set_blocking_mode(false)
                 .context("Cannot make FIDO HID device non-blocking")?;
             info!(
-                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}{}",
-                info.product_name,
-                info.vendor_id,
-                info.product_id,
-                path,
-                if passthrough {
-                    " in passthrough mode: the remote session asks for the PIN"
-                } else {
-                    ""
-                }
+                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}",
+                info.product_name, info.vendor_id, info.product_id, path,
             );
             return Ok(Self {
                 device,
@@ -259,14 +274,13 @@ impl FidoClient {
                 pending_get_info: HashSet::new(),
                 proxy_secret: SecretKey::random(&mut OsRng),
                 pin_session: None,
-                passthrough,
                 es256_only,
             });
         }
 
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = (requested_path, passthrough, es256_only);
+            let _ = (requested_path, es256_only);
             Err(anyhow!(
                 "FIDO forwarding is supported only by Linux and Windows clients"
             ))
@@ -291,13 +305,13 @@ impl FidoClient {
                         "Authenticator answered {}",
                         describe_message(&message, false)
                     );
-                    trace_payload("Authenticator payload", &message.payload, false);
+                    trace_payload("Authenticator payload", &message.payload);
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
                         debug!("Rewriting the GetInfo answer for cid 0x{:08x}", message.cid);
                         advertise_local_pin_broker(&mut message.payload, self.es256_only)?;
                         info!("FIDO GetInfo response exposes the local PIN broker");
-                        trace_payload("Rewritten payload", &message.payload, false);
+                        trace_payload("Rewritten payload", &message.payload);
                     }
                     self.output.extend(fragment_message(&message)?);
                 }
@@ -343,11 +357,15 @@ impl FidoClient {
     #[cfg(any(target_os = "linux", windows))]
     fn handle_remote_message(&mut self, mut message: CtapMessage) -> Result<()> {
         debug!("Remote session sent {}", describe_message(&message, true));
-        if self.passthrough {
-            debug!("Passthrough mode: forwarding to the authenticator untouched");
-            return self.write_message(&message);
+        if let Some(refusal) = refuse_remote_message(&message) {
+            warn!(
+                "Refused a remote FIDO request outside the allowlist: {}",
+                describe_message(&message, true)
+            );
+            self.output.extend(fragment_message(&refusal)?);
+            return Ok(());
         }
-        if message.command != CTAPHID_CBOR || message.payload.is_empty() {
+        if message.command != CTAPHID_CBOR {
             debug!("Forwarding the message to the authenticator untouched");
             return self.write_message(&message);
         }
@@ -510,7 +528,8 @@ impl FidoClient {
             return Err(anyhow!("Unsupported ClientPIN permission set"));
         }
         let rp_id = map_text(request, 10)?.to_owned();
-        debug!("Remote session asks for a token on {rp_id:?} with permissions 0x{permissions:02x}");
+        // The RP identifies the site being signed into: it stays out of the log.
+        debug!("Remote session asks for a token with permissions 0x{permissions:02x}");
         let remote_key = parse_cose_public(map_value(request, 3)?)?;
         let remote_secret = shared_secret(&self.proxy_secret, &remote_key);
 
@@ -665,7 +684,6 @@ impl FidoClient {
 
     #[cfg(any(target_os = "linux", windows))]
     fn physical_transact(&mut self, cid: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
-        let sensitive = payload.first() == Some(&CTAP_CLIENT_PIN);
         if let Some(subcommand) = payload
             .get(1..)
             .and_then(|cbor| decode_map(cbor).ok())
@@ -676,7 +694,7 @@ impl FidoClient {
                 client_pin_subcommand_name(subcommand)
             );
         }
-        trace_payload("Broker request", &payload, sensitive);
+        trace_payload("Broker request", &payload);
         let started_at = Instant::now();
         self.write_message(&CtapMessage {
             cid,
@@ -696,7 +714,7 @@ impl FidoClient {
                         ctap_status_name(status),
                         started_at.elapsed().as_millis()
                     );
-                    trace_payload("Broker answer", &message.payload, sensitive);
+                    trace_payload("Broker answer", &message.payload);
                     return Ok(message.payload);
                 }
                 debug!(
@@ -819,43 +837,6 @@ fn debug_ctaphid_message(
     }
 }
 
-fn ctaphid_command_name(command: u8) -> &'static str {
-    match command {
-        0x01 => "PING",
-        0x03 => "MSG",
-        0x04 => "LOCK",
-        0x06 => "INIT",
-        0x08 => "WINK",
-        CTAPHID_CBOR => "CBOR",
-        0x11 => "CANCEL",
-        0x3b => "KEEPALIVE",
-        0x3f => "ERROR",
-        _ => "UNKNOWN",
-    }
-}
-
-fn ctap_command_name(command: u8) -> &'static str {
-    match command {
-        CTAP_MAKE_CREDENTIAL => "MakeCredential",
-        CTAP_GET_ASSERTION => "GetAssertion",
-        CTAP_GET_INFO => "GetInfo",
-        CTAP_CLIENT_PIN => "ClientPIN",
-        0x08 => "GetNextAssertion",
-        _ => "Unknown",
-    }
-}
-
-fn ctap_status_name(status: u8) -> &'static str {
-    match status {
-        CTAP2_OK => "OK",
-        CTAP2_ERR_OPERATION_DENIED => "OperationDenied",
-        CTAP2_ERR_PIN_INVALID => "PinInvalid",
-        CTAP2_ERR_PIN_AUTH_INVALID => "PinAuthInvalid",
-        CTAP2_ERR_INVALID_SUBCOMMAND => "InvalidSubcommand",
-        _ => "Unknown",
-    }
-}
-
 fn ctaphid_report_count(payload_len: usize) -> usize {
     1 + (payload_len.saturating_sub(57) + 58) / 59
 }
@@ -928,6 +909,69 @@ impl CtapAssembler {
     }
 }
 
+/// CTAPHID transport commands the remote session may send to the physical
+/// authenticator. Everything else is answered locally with an error:
+/// - LOCK would let the session hold the authenticator for itself;
+/// - KEEPALIVE and ERROR only flow from the authenticator to the platform;
+/// - vendor commands (0x40 to 0x7f) reach the firmware configuration (ykman
+///   writes the enabled USB applications that way).
+///
+/// MSG (U2F) stays allowed: U2F has no destructive command, only register and
+/// authenticate with a touch, and platforms fall back to it for the `appid`
+/// extension.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn remote_ctaphid_command_allowed(command: u8) -> bool {
+    matches!(
+        command,
+        CTAPHID_PING | CTAPHID_MSG | CTAPHID_INIT | CTAPHID_WINK | CTAPHID_CBOR | CTAPHID_CANCEL
+    )
+}
+
+/// CTAP2 (CBOR) commands the remote session may use: what a browser needs to
+/// register and use a credential. Reset (wipes every credential of the key
+/// after a touch), Config, CredentialManagement, BioEnrollment, LargeBlobs and
+/// the vendor and prototype commands (0x40 and above) are refused locally:
+/// they manage the authenticator, which is the job of the workstation, not of
+/// a remote session.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn remote_ctap_command_allowed(command: u8) -> bool {
+    matches!(
+        command,
+        CTAP_MAKE_CREDENTIAL
+            | CTAP_GET_ASSERTION
+            | CTAP_GET_INFO
+            | CTAP_CLIENT_PIN
+            | CTAP_GET_NEXT_ASSERTION
+            | CTAP_SELECTION
+    )
+}
+
+/// The local answer to a message of the remote session that must not reach
+/// the physical authenticator, or `None` if the message may go on.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+fn refuse_remote_message(message: &CtapMessage) -> Option<CtapMessage> {
+    let ctaphid_error = |code: u8| CtapMessage {
+        cid: message.cid,
+        command: CTAPHID_ERROR,
+        payload: vec![code],
+    };
+    if !remote_ctaphid_command_allowed(message.command) {
+        return Some(ctaphid_error(CTAPHID_ERR_INVALID_CMD));
+    }
+    if message.command != CTAPHID_CBOR {
+        return None;
+    }
+    match message.payload.first() {
+        None => Some(ctaphid_error(CTAPHID_ERR_INVALID_LEN)),
+        Some(&command) if !remote_ctap_command_allowed(command) => Some(CtapMessage {
+            cid: message.cid,
+            command: CTAPHID_CBOR,
+            payload: ctap_error(CTAP1_ERR_INVALID_COMMAND),
+        }),
+        Some(_) => None,
+    }
+}
+
 fn fragment_message(message: &CtapMessage) -> Result<Vec<Vec<u8>>> {
     if message.payload.len() > MAX_CTAPHID_PAYLOAD || message.payload.len() > u16::MAX as usize {
         return Err(anyhow!("CTAPHID payload is too large"));
@@ -991,36 +1035,34 @@ fn write_hid_report(device: &hidapi::HidDevice, report: &[u8]) -> Result<()> {
 }
 
 /// Human-readable CTAPHID transport command, for the RUST_LOG=debug traces.
-#[cfg(any(target_os = "linux", windows))]
 fn ctaphid_command_name(command: u8) -> &'static str {
     match command {
-        0x03 => "MSG",
-        0x08 => "WINK",
-        0x0c => "LOCK",
+        CTAPHID_PING => "PING",
+        CTAPHID_MSG => "MSG",
+        CTAPHID_LOCK => "LOCK",
         CTAPHID_INIT => "INIT",
+        CTAPHID_WINK => "WINK",
         CTAPHID_CBOR => "CBOR",
-        0x11 => "KEEPALIVE",
-        0x3b => "PING",
-        0x3e => "CANCEL",
-        0x3f => "ERROR",
+        CTAPHID_CANCEL => "CANCEL",
+        CTAPHID_KEEPALIVE => "KEEPALIVE",
+        CTAPHID_ERROR => "ERROR",
         _ => "vendor/unknown",
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
 fn ctap_command_name(command: u8) -> &'static str {
     match command {
         CTAP_MAKE_CREDENTIAL => "MakeCredential",
         CTAP_GET_ASSERTION => "GetAssertion",
         CTAP_GET_INFO => "GetInfo",
         CTAP_CLIENT_PIN => "ClientPIN",
-        0x07 => "Reset",
-        0x08 => "GetNextAssertion",
-        0x09 => "BioEnrollment",
-        0x0a => "CredentialManagement",
-        0x0b => "Selection",
-        0x0c => "LargeBlobs",
-        0x0d => "Config",
+        CTAP_RESET => "Reset",
+        CTAP_GET_NEXT_ASSERTION => "GetNextAssertion",
+        CTAP_BIO_ENROLLMENT => "BioEnrollment",
+        CTAP_CREDENTIAL_MANAGEMENT => "CredentialManagement",
+        CTAP_SELECTION => "Selection",
+        CTAP_LARGE_BLOBS => "LargeBlobs",
+        CTAP_CONFIG => "Config",
         _ => "unknown",
     }
 }
@@ -1029,7 +1071,6 @@ fn ctap_command_name(command: u8) -> &'static str {
 /// authenticator refusing a command it does not implement answers
 /// CTAP1_ERR_INVALID_COMMAND, which is the signature of a platform using a
 /// feature the physical key does not have.
-#[cfg(any(target_os = "linux", windows))]
 fn ctap_status_name(status: u8) -> &'static str {
     match status {
         CTAP2_OK => "OK",
@@ -1087,9 +1128,9 @@ fn client_pin_subcommand_name(subcommand: u8) -> &'static str {
         0x03 => "setPIN",
         0x04 => "changePIN",
         CLIENT_PIN_GET_PIN_TOKEN => "getPinToken",
-        CLIENT_PIN_TOKEN_USING_PIN => "getPinUvAuthTokenUsingPinWithPermissions",
-        CLIENT_PIN_GET_UV_RETRIES => "getUVRetries",
         CLIENT_PIN_TOKEN_USING_UV => "getPinUvAuthTokenUsingUvWithPermissions",
+        CLIENT_PIN_GET_UV_RETRIES => "getUVRetries",
+        CLIENT_PIN_TOKEN_USING_PIN => "getPinUvAuthTokenUsingPinWithPermissions",
         _ => "unknown",
     }
 }
@@ -1193,20 +1234,13 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Trace-level payload dump. `redact` is set for every PIN protocol exchange:
-/// those payloads only ever carry ciphertext, but nothing on a PIN code path is
-/// written to the log. The PIN itself never leaves pinentry and
-/// `obtain_physical_pin_token`, and no logging path can reach it.
+/// Trace-level payload summary: its size, never its content. A CTAP payload
+/// carries the RP, the user name and display name of a new credential, and
+/// credential identifiers; PIN protocol exchanges carry key agreements and
+/// encrypted tokens. None of it belongs in a log, whatever its level.
 #[cfg(any(target_os = "linux", windows))]
-fn trace_payload(label: &str, payload: &[u8], redact: bool) {
-    if !log_enabled!(log::Level::Trace) {
-        return;
-    }
-    if redact {
-        trace!("{label}: {} byte(s) withheld (PIN protocol)", payload.len());
-    } else {
-        trace!("{label}: {}", hex(payload));
-    }
+fn trace_payload(label: &str, payload: &[u8]) {
+    trace!("{label}: {} byte(s)", payload.len());
 }
 
 #[cfg(any(target_os = "linux", windows))]
@@ -1479,6 +1513,18 @@ fn restrict_to_es256(info: &mut BTreeMap<Value, Value>) {
     );
 }
 
+/// GetInfo options of the management commands the remote session cannot
+/// use (CredentialManagement, Config, BioEnrollment, LargeBlobs).
+const HIDDEN_MANAGEMENT_OPTIONS: &[&str] = &[
+    "credMgmt",
+    "credentialMgmtPreview",
+    "authnrCfg",
+    "bioEnroll",
+    "userVerificationMgmtPreview",
+    "largeBlobs",
+    "setMinPINLength",
+];
+
 fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
@@ -1513,6 +1559,17 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result
     // remote PIN-setup UI in platform implementations.
     options.remove(&Value::Text("clientPin".to_owned()));
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
+    // The management commands are refused by remote_ctap_command_allowed:
+    // advertising them would only make the platform try and fail.
+    for option in HIDDEN_MANAGEMENT_OPTIONS {
+        options.remove(&Value::Text((*option).to_owned()));
+    }
+    // maxSerializedLargeBlobArray, and the extension that relies on the
+    // LargeBlobs command.
+    info.remove(&Value::Integer(11));
+    if let Some(Value::Array(extensions)) = info.get_mut(&Value::Integer(2)) {
+        extensions.retain(|extension| extension != &Value::Text("largeBlobKey".to_owned()));
+    }
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
     // forcePINChange and minPINLength describe the Client PIN feature. Leaving
     // them in place while `clientPin` is hidden makes the answer contradict
@@ -1553,11 +1610,16 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
                 b"SETTITLE Sanzu - YubiKey locale\nSETPROMPT PIN:\nSETDESC Entrez le PIN de la YubiKey branchee sur cet ordinateur\nGETPIN\nBYE\n",
             )?;
         }
-        let mut stdout = String::new();
+        // `stdout` carries the PIN on its `D ` line. It is wiped on drop, and
+        // its capacity is reserved and the read bounded to it so the buffer is
+        // never reallocated: a reallocation would leave a copy of the PIN in
+        // freed memory that nothing wipes.
+        let mut stdout = Zeroizing::new(String::with_capacity(PINENTRY_OUTPUT_LIMIT));
         child
             .stdout
             .take()
             .context("Cannot open pinentry output")?
+            .take(PINENTRY_OUTPUT_LIMIT as u64)
             .read_to_string(&mut stdout)?;
         let status = child.wait().context("Cannot wait for pinentry")?;
         // `stdout` carries the PIN on its `D ` line: only the exit status, the
@@ -1582,7 +1644,7 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
             if pin.is_empty() {
                 return Err(anyhow!("The local PIN prompt returned an empty PIN"));
             }
-            return Ok(Zeroizing::new(pin));
+            return Ok(pin);
         }
         debug!("{program} returned no PIN line; treating it as a cancellation");
         return Err(anyhow!("The local PIN prompt was cancelled"));
@@ -1597,7 +1659,10 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
     ))
 }
 
-fn decode_assuan_data(encoded: &str) -> Result<String> {
+/// Decodes the Assuan `D ` line into the PIN, wiped on drop. The bytes are
+/// decoded into a buffer sized up front, then moved, not copied, into the
+/// returned string: no intermediate copy of the PIN outlives this function.
+fn decode_assuan_data(encoded: &str) -> Result<Zeroizing<String>> {
     let mut decoded = Zeroizing::new(Vec::with_capacity(encoded.len()));
     let bytes = encoded.as_bytes();
     let mut index = 0;
@@ -1617,7 +1682,14 @@ fn decode_assuan_data(encoded: &str) -> Result<String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded.to_vec()).context("pinentry returned a non-UTF-8 PIN")
+    if std::str::from_utf8(&decoded).is_err() {
+        return Err(anyhow!("pinentry returned a non-UTF-8 PIN"));
+    }
+    let bytes = std::mem::take(&mut *decoded);
+    // Checked just above; the conversion takes the buffer over without copying.
+    Ok(Zeroizing::new(
+        String::from_utf8(bytes).expect("UTF-8 checked above"),
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1776,28 +1848,21 @@ pub fn same_fido_device(left: &tunnel::FidoDevice, right: &tunnel::FidoDevice) -
 /// What the device thread needs to reopen the authenticator it lost.
 pub struct FidoReopen {
     selector: Option<String>,
-    passthrough: bool,
     es256_only: bool,
     expected: tunnel::FidoDevice,
 }
 
 impl FidoReopen {
-    pub fn new(
-        selector: Option<String>,
-        passthrough: bool,
-        es256_only: bool,
-        expected: tunnel::FidoDevice,
-    ) -> Self {
+    pub fn new(selector: Option<String>, es256_only: bool, expected: tunnel::FidoDevice) -> Self {
         Self {
             selector,
-            passthrough,
             es256_only,
             expected,
         }
     }
 
     fn try_open(&self) -> Option<FidoClient> {
-        match FidoClient::open(self.selector.as_deref(), self.passthrough, self.es256_only) {
+        match FidoClient::open(self.selector.as_deref(), self.es256_only) {
             Ok(candidate) if same_fido_device(&candidate.info(), &self.expected) => {
                 info!("Local FIDO authenticator reconnected; forwarding resumed");
                 Some(candidate)
@@ -2185,6 +2250,120 @@ mod tests {
     }
 
     #[test]
+    fn get_info_hides_the_management_commands() {
+        let options = BTreeMap::from([
+            (Value::Text("credMgmt".to_owned()), Value::Bool(true)),
+            (Value::Text("authnrCfg".to_owned()), Value::Bool(true)),
+            (Value::Text("largeBlobs".to_owned()), Value::Bool(true)),
+            (Value::Text("rk".to_owned()), Value::Bool(true)),
+        ]);
+        let mut payload = ctap_success(map_of([
+            (1, Value::Array(vec![Value::Text("FIDO_2_1".to_owned())])),
+            (
+                2,
+                Value::Array(vec![
+                    Value::Text("credProtect".to_owned()),
+                    Value::Text("largeBlobKey".to_owned()),
+                ]),
+            ),
+            (4, Value::Map(options)),
+            (11, Value::Integer(1024)),
+        ]))
+        .unwrap();
+        advertise_local_pin_broker(&mut payload, false).unwrap();
+        let info = successful_map(&payload, "test").unwrap();
+        let Value::Map(options) = map_value(&info, 4).unwrap() else {
+            panic!("options should be a map");
+        };
+        for hidden in ["credMgmt", "authnrCfg", "largeBlobs"] {
+            assert_eq!(options.get(&Value::Text(hidden.to_owned())), None);
+        }
+        assert_eq!(
+            options.get(&Value::Text("rk".to_owned())),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(info.get(&Value::Integer(11)), None);
+        assert_eq!(
+            map_value(&info, 2).unwrap(),
+            &Value::Array(vec![Value::Text("credProtect".to_owned())])
+        );
+    }
+
+    fn remote(command: u8, payload: Vec<u8>) -> CtapMessage {
+        CtapMessage {
+            cid: 0x0102_0304,
+            command,
+            payload,
+        }
+    }
+
+    #[test]
+    fn relays_the_commands_a_browser_needs() {
+        for command in [
+            CTAPHID_PING,
+            CTAPHID_MSG,
+            CTAPHID_INIT,
+            CTAPHID_WINK,
+            CTAPHID_CANCEL,
+        ] {
+            assert_eq!(refuse_remote_message(&remote(command, vec![0; 8])), None);
+        }
+        for ctap in [
+            CTAP_MAKE_CREDENTIAL,
+            CTAP_GET_ASSERTION,
+            CTAP_GET_INFO,
+            CTAP_CLIENT_PIN,
+            CTAP_GET_NEXT_ASSERTION,
+            CTAP_SELECTION,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(CTAPHID_CBOR, vec![ctap, 0xa0])),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_the_management_and_vendor_commands_locally() {
+        // Regression for sanzu-fido-relay-unfiltered-commands: none of these
+        // may reach the physical authenticator.
+        for ctap in [
+            CTAP_RESET,
+            CTAP_BIO_ENROLLMENT,
+            CTAP_CREDENTIAL_MANAGEMENT,
+            CTAP_LARGE_BLOBS,
+            CTAP_CONFIG,
+            0x40,
+            0x41,
+            0xff,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(CTAPHID_CBOR, vec![ctap])),
+                Some(remote(CTAPHID_CBOR, vec![CTAP1_ERR_INVALID_COMMAND])),
+                "CTAP command 0x{ctap:02x}"
+            );
+        }
+        for command in [
+            CTAPHID_LOCK,
+            CTAPHID_KEEPALIVE,
+            CTAPHID_ERROR,
+            0x40,
+            0x50,
+            0x7f,
+        ] {
+            assert_eq!(
+                refuse_remote_message(&remote(command, vec![0x00])),
+                Some(remote(CTAPHID_ERROR, vec![CTAPHID_ERR_INVALID_CMD])),
+                "CTAPHID command 0x{command:02x}"
+            );
+        }
+        assert_eq!(
+            refuse_remote_message(&remote(CTAPHID_CBOR, vec![])),
+            Some(remote(CTAPHID_ERROR, vec![CTAPHID_ERR_INVALID_LEN]))
+        );
+    }
+
+    #[test]
     fn keeps_only_es256_when_asked_and_never_empties_the_list() {
         let es256 = Value::Map(BTreeMap::from([
             (Value::Text("alg".to_owned()), Value::Integer(-7)),
@@ -2250,6 +2429,43 @@ mod tests {
         }
     }
 
+    /// Values from CTAP 2.1, authenticatorClientPIN, written as literals: the
+    /// test must not share the constants it checks. 0x06 and 0x09 were once
+    /// swapped in the code, and a test built on the constants could not see it.
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn client_pin_subcommands_follow_the_ctap_specification() {
+        for (value, name) in [
+            (0x01, "getPINRetries"),
+            (0x02, "getKeyAgreement"),
+            (0x03, "setPIN"),
+            (0x04, "changePIN"),
+            (0x05, "getPinToken"),
+            (0x06, "getPinUvAuthTokenUsingUvWithPermissions"),
+            (0x07, "getUVRetries"),
+            (0x09, "getPinUvAuthTokenUsingPinWithPermissions"),
+        ] {
+            assert_eq!(
+                client_pin_subcommand_name(value),
+                name,
+                "ClientPIN subcommand 0x{value:02x}"
+            );
+        }
+        for (value, action) in [
+            (0x01, ClientPinAction::PinRetries),
+            (0x02, ClientPinAction::KeyAgreement),
+            (0x06, ClientPinAction::IssueToken),
+            (0x07, ClientPinAction::UvRetries),
+            (0x09, ClientPinAction::IssueToken),
+        ] {
+            assert_eq!(client_pin_action(value), action, "subcommand 0x{value:02x}");
+        }
+        // setPIN, changePIN, getPinToken and the reserved 0x08 stay unreachable.
+        for value in [0x03, 0x04, 0x05, 0x08] {
+            assert_eq!(client_pin_action(value), ClientPinAction::Unsupported);
+        }
+    }
+
     #[test]
     fn pin_protocol_crypto_round_trips() {
         let first = SecretKey::random(&mut OsRng);
@@ -2273,8 +2489,12 @@ mod tests {
 
     #[test]
     fn parses_pinentry_assuan_escaping() {
-        assert_eq!(decode_assuan_data("12%2034%25").unwrap(), "12 34%");
+        assert_eq!(decode_assuan_data("12%2034%25").unwrap().as_str(), "12 34%");
         assert!(decode_assuan_data("12%2").is_err());
+        assert!(
+            decode_assuan_data("%ff").is_err(),
+            "a non-UTF-8 PIN is refused"
+        );
     }
 
     #[test]

@@ -4,15 +4,15 @@ stages:
 
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
-  # Attestation de provenance SLSA des artefacts par le runner (skill sbom).
-  RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
-  SLSA_PROVENANCE_SCHEMA_VERSION: "v1"
   DEBIAN_PACKAGE_DIR: dist/debian-trixie
   GENERIC_PACKAGE_NAME: sanzu-debian-trixie
 
 package:debian:trixie:
   stage: package
   image: rust:1-trixie
+  # apt-get, cargo install and cargo deb download from the internet
+  tags:
+    - online
   cache:
     key: cargo-debian-trixie-rust-1-cargo-deb-2.9.2
     paths:
@@ -34,29 +34,32 @@ package:debian:trixie:
     - cargo deb --version >/dev/null 2>&1 || cargo install cargo-deb --version 2.9.2 --locked
   script:
     - mkdir -p "${DEBIAN_PACKAGE_DIR}"
-    - cargo deb --locked -p sanzu
-    - cargo deb --locked -p sanzu --variant=client
-    - cargo deb --locked -p sanzu_broker
+    # Each build of main is published and installed automatically: it needs
+    # its own, increasing Debian revision (1+git<pipeline iid> sorts after the
+    # -1 of the release and after the previous build of main). Release tags
+    # keep -1.
+    - |
+      if [ -n "${CI_COMMIT_TAG}" ]; then
+        DEB_REVISION="1"
+      else
+        DEB_REVISION="1+git${CI_PIPELINE_IID}"
+      fi
+      echo "Debian revision: ${DEB_REVISION}"
+      echo "DEB_REVISION=${DEB_REVISION}" > deb-revision.env
+    - cargo deb --locked -p sanzu --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu --variant=client --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu_broker --deb-revision "${DEB_REVISION}"
+    - cargo deb --locked -p sanzu-web --deb-revision "${DEB_REVISION}"
     - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
-    - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
+    - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 4
     - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
-    # SBOM CycloneDX et manifeste de release (skill sbom) inclus dans le paquet
-    # sanzu ; vue de construction : paquets Debian du build (la chaîne Rust
-    # vient de l'image rust:1-trixie, relevée hors paquets).
-    - >-
-      SBOM_CARRIER=sanzu
-      SBOM_BUILD_ROOTS="clang, cmake, g++, libavdevice-dev, libavfilter-dev, libavformat-dev,
-      libavutil-dev, libclang-dev, libdbus-1-dev, libkrb5-dev, libpam0g-dev, libx264-dev,
-      libxcb-render0-dev, libxcb-shape0-dev, libxcb-xfixes0-dev, libxdamage-dev, libxext-dev,
-      libasound2-dev, pkg-config, protobuf-compiler"
-      bash ci/sbom-inject.sh "${DEBIAN_PACKAGE_DIR}"
     - find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' -print
   artifacts:
     name: "sanzu-debian-trixie-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/debian-trixie/*.deb
-      - dist/debian-trixie/*.cdx.json
-      - dist/debian-trixie/*.sbom-manifest.json
+    reports:
+      dotenv: deb-revision.env
     expire_in: 30 days
   rules:
     - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
@@ -66,25 +69,31 @@ package:debian:trixie:
 publish:debian:trixie:
   stage: publish
   image:
-    name: curlimages/curl:8.12.1
+    name: debian:trixie
     entrypoint: [""]
   needs:
     - job: package:debian:trixie
       artifacts: true
+  before_script:
+    # debian:trixie n'a pas curl : l'envoi vers le registry en a besoin.
+    - apt-get update -qq
+    - apt-get install -qq -y --no-install-recommends ca-certificates curl >/dev/null
   script:
     - PACKAGE_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' sanzu/Cargo.toml)"
     - |
       if [ -n "${CI_COMMIT_TAG}" ]; then
         test "${CI_COMMIT_TAG}" = "sanzu-v${PACKAGE_VERSION}"
+        test "${DEB_REVISION}" = "1"
         REGISTRY_VERSION="${PACKAGE_VERSION}"
       else
         test "${CI_COMMIT_BRANCH}" = "${CI_DEFAULT_BRANCH}"
-        REGISTRY_VERSION="${PACKAGE_VERSION}-${CI_COMMIT_SHORT_SHA}"
+        test "${DEB_REVISION}" = "1+git${CI_PIPELINE_IID}"
+        # Same version as the Debian packages it holds, never reused.
+        REGISTRY_VERSION="${PACKAGE_VERSION}-${DEB_REVISION}"
       fi
       export REGISTRY_VERSION
     - |
-      # SBOM et manifeste d'abord, les .deb ensuite.
-      for package in "${DEBIAN_PACKAGE_DIR}"/*.cdx.json "${DEBIAN_PACKAGE_DIR}"/*.sbom-manifest.json "${DEBIAN_PACKAGE_DIR}"/*.deb; do
+      for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do
         filename="$(basename "${package}")"
         curl --fail-with-body --location \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \

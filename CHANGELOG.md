@@ -13,6 +13,163 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and PIN broker state transitions. Sensitive payload contents and relying-party
   identifiers remain omitted.
 
+### Security
+- Broker and server: the TLS client identity is read from the leaf
+  certificate, the only one verified by rustls, instead of the last
+  certificate of the chain sent by the client. A client could append a
+  self-signed certificate naming another account and log in as that account.
+  Chains longer than 4 certificates are refused.
+- FIDO relay: allowlist of the commands the remote session may send to the
+  workstation authenticator. CTAPHID PING, MSG, INIT, WINK, CBOR and CANCEL
+  pass; LOCK and the vendor commands (0x40-0x7f) get a CTAPHID error. CTAP2
+  MakeCredential, GetAssertion, GetNextAssertion, GetInfo, ClientPIN and
+  Selection pass; Reset, Config, CredentialManagement, BioEnrollment,
+  LargeBlobs and the vendor commands are answered locally with
+  `CTAP1_ERR_INVALID_COMMAND`. GetInfo no longer advertises these features.
+- Server (Linux): the X server joined through `DISPLAY` must run as the uid
+  of `sanzu_server` (or root), checked with `SO_PEERCRED` on the socket.
+  x11rb tries the abstract socket `@/tmp/.X11-unix/X<n>` first, which any
+  process of the network namespace may create: another account squatting a
+  free display would otherwise receive the MIT cookie and the input events.
+
+### Changed
+- CI: each build of `main` gets its own Debian revision, `1+git<pipeline
+  iid>`, and is published under the registry version
+  `<version>-1+git<pipeline iid>`. Every commit of main was published as
+  `<version>-1`, which the lab repository refused as a duplicate. Release tags
+  keep the `-1` revision.
+
+### Fixed
+- FIDO traces: the CTAPHID command names (PING, LOCK, CANCEL, KEEPALIVE) used
+  wrong codes.
+
+## [0.2.17] - 2026-10-23
+
+### Changed
+- CI: the Debian package job runs only on runners tagged `online`, as it
+  downloads Debian packages, cargo-deb and crates.
+
+## [0.2.16] - 2026-10-23
+
+### Added
+- Server: AV1 (`libsvtav1`, `libaom-av1`, `av1_nvenc`, `av1_qsv`, `av1_amf`)
+  and VP9 (`libvpx-vp9`, `vp9_qsv`) encoders. The client decodes AV1 with
+  dav1d.
+- sanzu-web: VP9 and AV1 decoding with WebCodecs. VP9 4:4:4 gives browsers a
+  sharp image, which H.264 4:4:4 cannot.
+- Low latency `libsvtav1` and `libvpx-vp9` sections in `sanzu.toml`, and
+  recommended settings without GPU encoding in the README.
+
+### Fixed
+- Client: decode the frame as soon as the FFmpeg parser returns it. The AV1
+  and VP9 parsers return it on the call that consumes the input, and the next
+  call, with no input left, dropped it.
+
+## [0.2.15] - 2026-10-23
+
+### Added
+- Client, clipboard `trig` mode: pasting (Ctrl+V, Ctrl+Shift+V, Shift+Insert)
+  while the local clipboard has not been sent displays a flash message, in
+  French, at the top of the session for 3 seconds (X11, Wayland and Windows
+  clients).
+- Client, clipboard `trig` mode: Ctrl+Alt+Shift+V sends the local clipboard,
+  like Ctrl+Alt+Shift+C.
+
+### Changed
+- The client OSD (stats, flash messages) uses the ISO 8859-1 font, to display
+  accented characters.
+
+## [0.2.14] - 2026-10-22
+
+### Added
+- `sanzu-web` Debian package: binary, `sanzu-web.service` unit installed
+  disabled, and examples under `/usr/share/doc/sanzu-web/examples`. The CI
+  builds and publishes it with the three other packages.
+
+## [0.2.13] - 2026-10-22
+
+### Added
+- `sanzu-web` (demo): the sanzu client in a browser, in the manner of
+  Guacamole. The gateway logs users in with PAM (login / password) or OpenID
+  Connect (authorization code with PKCE), starts their server through the
+  `sanzu_broker` `on_connect` callback and relays the session over a
+  WebSocket; the browser decodes the H.264 frames with WebCodecs. Keyboard,
+  mouse, wheel, cursor, resize and clipboard are supported; not seamless
+  mode, FIDO, Kerberos nor sound. The server for browsers needs
+  `pixel_format = "yuv420p"`. Not packaged yet.
+
+## [0.2.12] - 2026-10-22
+
+### Added
+- Native Wayland client (prototype), seamless mode included: one fullscreen
+  surface, transparent and click-through outside the remote windows.
+  `wp_viewporter` scales the frame, so `--zoom` and fractional output scales
+  cost no CPU. Keyboard, mouse, wheel, ARGB cursor and clipboard follow the
+  X11 client; `--monitor`, Ctrl+Alt+Shift+N and `--grab-keyboard` work on
+  Wayland outputs.
+- `--backend auto|wayland|x11` (Linux): `auto` uses Wayland when
+  `WAYLAND_DISPLAY` is set and falls back to X11; `x11` runs through XWayland
+  in a Wayland session. No new runtime library: the Wayland protocol is
+  implemented in Rust.
+
+### Known limitations
+- Wayland client: no primary selection, no Scroll Lock synchronisation, cursor
+  not scaled to the output; keyboard and mouse still to be validated on Plasma.
+
+## [0.2.11] - 2026-10-22
+
+### Added
+- X11 client: `--monitor <index|output>` opens the client on one monitor,
+  named by its `xrandr --listmonitors` index or its output name (RandR 1.5).
+- X11 client: Ctrl+Alt+Shift+N moves the client to the next monitor, also
+  in fullscreen, which KWin otherwise refuses to move; in seamless mode the
+  window had to leave fullscreen and be moved from the window menu.
+- X11 client: set `WM_CLASS` (`sanzu_client`/`Sanzu`) and `_NET_WM_NAME`, so
+  window manager rules can match the client whatever its title.
+
+## [0.2.10] - 2026-10-11
+
+### Security
+- Remove `--fido-passthrough`. It forwarded the authenticator untouched and
+  let the remote session prompt for the PIN, the very exposure the local PIN
+  broker exists to prevent; no released build may offer it.
+- Keep the PIN out of freed memory: the pinentry output, which carries it, is
+  now wiped on drop and read into a buffer that is never reallocated, and the
+  decoded PIN is moved, not copied, into its wiped string.
+- Log CTAP payload sizes only. Trace level used to dump them in hexadecimal,
+  with the relying party, the user name and display name of new credentials
+  and credential identifiers; the relying party is also gone from the debug
+  log of a token request.
+
+### Fixed
+- Name the ClientPIN subcommands as CTAP 2.1 does: 0x06 is
+  `getPinUvAuthTokenUsingUvWithPermissions` and 0x09
+  `getPinUvAuthTokenUsingPinWithPermissions`; the code had them swapped. Both
+  reach the same local prompt, so behaviour is unchanged; names and logs were
+  wrong. A test now checks the specification values written as literals.
+
+## [0.2.9] - 2026-10-11
+
+### Fixed
+- Accept certificate chains whose CA carries name constraints. The 0.2.8
+  packages embedded rustls 0.21.0 and rustls-webpki 0.100.1, which reject such
+  chains with a bare `UnknownIssuer`, so the client could not connect to a
+  broker certified by a name constrained CA. rustls 0.21.12, already in the
+  lock file since the RUSTSEC-2024-0336 update, verifies with rustls-webpki
+  0.101; this release ships it, with a regression test on a real chain.
+
+### Changed
+- Update webpki-roots to 0.25, which no longer pulls rustls-webpki 0.100: a
+  single webpki version is left in the dependency graph. Drop the unused
+  webpki-roots dependency of the `sanzu` crate.
+
+### Known issues
+- rustls-webpki, in every version, rejects a client certificate carrying an
+  rfc822Name (email) subject alternative name when the issuing CA constrains
+  that name type: it does not implement rfc822Name constraints. The broker
+  then refuses the client with `NameConstraintViolation`. The CA must not
+  constrain rfc822Name, or the client identity must use another name type.
+
 ## [0.2.8] - 2026-08-16
 
 ### Fixed

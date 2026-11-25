@@ -275,6 +275,42 @@ pub fn get_subj_alt_names(cert: &x509_parser::certificate::X509Certificate) -> R
     }
 }
 
+/// Maximum number of certificates accepted in a client chain: the leaf, the
+/// issuing intermediate and some slack for a deeper PKI. A longer chain is
+/// refused rather than parsed.
+pub const MAX_CLIENT_CHAIN_LEN: usize = 4;
+
+/// Return the user name carried by a client certificate chain, once the TLS
+/// handshake has succeeded.
+///
+/// The identity is read from the *leaf* certificate (`certs[0]`), which is the
+/// only one rustls has verified (`AllowAnyAuthenticatedClient` validates
+/// `certs[0]` with `certs[1..]` as candidate intermediates and silently ignores
+/// the ones that do not chain). Any other certificate of the chain is chosen
+/// by the client: reading the identity from it (as the former `certs.last()`
+/// did) let a client append a self-signed certificate carrying another
+/// account's rfc822 name and log in as that account.
+pub fn client_username_from_peer_certs(
+    certs: &[Certificate],
+    allowed_client_domains: &[String],
+) -> Result<String> {
+    if certs.len() > MAX_CLIENT_CHAIN_LEN {
+        return Err(anyhow!(
+            "Client certificate chain too long ({} > {})",
+            certs.len(),
+            MAX_CLIENT_CHAIN_LEN
+        ));
+    }
+    let leaf = certs.first().ok_or_else(|| anyhow!("No cert from user"))?;
+    let (_data, leaf) = x509_parser::certificate::X509Certificate::from_der(&leaf.0)
+        .context("Error in X509Certificate from der")?;
+    let subj_alt_name =
+        get_subj_alt_names(&leaf).context("Error in get subject alternative name")?;
+    debug!("Alt name: {:?}", subj_alt_name);
+    crate::utils::get_username_from_principal(&subj_alt_name, allowed_client_domains)
+        .context("Principal doesnt match realm pattern")
+}
+
 /// Server certificate verifier which logs the certificate chain sent by the
 /// server and the reason of the verification failures.
 /// The verification itself is delegated to the standard webpki verifier, so the
@@ -493,7 +529,7 @@ pub fn make_client_config(
             );
         }
     } else {
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
             OwnedTrustAnchor::from_subject_spki_name_constraints(
                 ta.subject,
                 ta.spki,
@@ -544,4 +580,116 @@ pub fn make_client_config(
     config.enable_sni = false;
     debug!("Tls client config ready (sni disabled)");
     Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::convert::TryFrom;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    // Real chain from a deployment: root CA and server certificate. The root
+    // and the intermediate carry critical name constraints (DNS, IP and
+    // rfc822). rustls-webpki 0.100 rejected this chain with `UnknownIssuer`;
+    // 0.101, pulled by rustls 0.21.12, accepts it.
+    const LAB_ROOT: &[u8] = include_bytes!("testdata/lab-root-g2.pem");
+    const SURF_CHAIN: &[u8] = include_bytes!("testdata/surf-chain-g2.pem");
+
+    /// 2026-09-21, within the validity of the server certificate
+    /// (2026-09-13 to 2026-12-12): the test does not depend on today's date.
+    fn during_validity() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_790_000_000)
+    }
+
+    fn certs(pem: &[u8]) -> Vec<Vec<u8>> {
+        rustls_pemfile::certs(&mut &pem[..]).unwrap()
+    }
+
+    fn lab_verifier() -> DebugServerCertVerifier {
+        let mut roots = RootCertStore::empty();
+        let (added, ignored) = roots.add_parsable_certificates(&certs(LAB_ROOT));
+        assert_eq!((added, ignored), (1, 0));
+        DebugServerCertVerifier::new(roots)
+    }
+
+    fn verify(name: &str) -> Result<ServerCertVerified, TlsError> {
+        let chain: Vec<Certificate> = certs(SURF_CHAIN).into_iter().map(Certificate).collect();
+        lab_verifier().verify_server_cert(
+            &chain[0],
+            &chain[1..],
+            &ServerName::try_from(name).unwrap(),
+            &mut std::iter::empty(),
+            &[],
+            during_validity(),
+        )
+    }
+
+    #[test]
+    fn accepts_a_chain_under_a_name_constrained_root() {
+        verify("surf.fred.lab").expect("a chain under a name constrained root must be accepted");
+    }
+
+    #[test]
+    fn still_checks_the_server_name() {
+        assert!(matches!(
+            verify("surf.example.com"),
+            Err(TlsError::InvalidCertificate(
+                CertificateError::NotValidForName
+            ))
+        ));
+    }
+
+    // Self-signed test certificates carrying `email:fred@fred.lab` and
+    // `email:jean@fred.lab`: only their subject alternative name matters here.
+    const CLIENT_FRED: &[u8] = include_bytes!("testdata/client-fred.pem");
+    const CLIENT_JEAN: &[u8] = include_bytes!("testdata/client-jean.pem");
+
+    fn client_chain(pems: &[&[u8]]) -> Vec<Certificate> {
+        pems.iter()
+            .flat_map(|pem| certs(pem))
+            .map(Certificate)
+            .collect()
+    }
+
+    fn lab_domains() -> Vec<String> {
+        vec!["fred.lab".to_owned()]
+    }
+
+    #[test]
+    fn client_identity_comes_from_the_leaf() {
+        let chain = client_chain(&[CLIENT_FRED]);
+        assert_eq!(
+            client_username_from_peer_certs(&chain, &lab_domains()).unwrap(),
+            "fred"
+        );
+    }
+
+    #[test]
+    fn an_appended_certificate_cannot_impersonate_another_account() {
+        // Regression for sanzu-broker-mtls-last-cert: fred's valid leaf
+        // followed by a self-signed certificate naming jean must stay fred.
+        let chain = client_chain(&[CLIENT_FRED, CLIENT_JEAN]);
+        assert_eq!(
+            client_username_from_peer_certs(&chain, &lab_domains()).unwrap(),
+            "fred"
+        );
+    }
+
+    #[test]
+    fn refuses_an_empty_or_too_long_client_chain() {
+        assert!(client_username_from_peer_certs(&[], &lab_domains()).is_err());
+        let chain = client_chain(&[CLIENT_FRED; MAX_CLIENT_CHAIN_LEN + 1]);
+        assert!(client_username_from_peer_certs(&chain, &lab_domains()).is_err());
+    }
+
+    #[test]
+    fn refuses_a_leaf_outside_the_allowed_domains() {
+        let chain = client_chain(&[CLIENT_FRED]);
+        assert!(client_username_from_peer_certs(&chain, &["example.com".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn builds_a_client_config_from_the_builtin_roots() {
+        make_client_config(None, None, None).expect("client config from the builtin webpki roots");
+    }
 }

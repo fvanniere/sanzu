@@ -22,6 +22,17 @@ pub struct DecoderTimings {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 cpufeatures::new!(cpuid_ssse3, "ssse3");
 
+/// FFmpeg decoder for a codec announced by the server
+///
+/// The native FFmpeg AV1 decoder only works with a hardware acceleration, so
+/// AV1 is decoded by dav1d
+pub fn default_decoder_name(codec_name: &str) -> &str {
+    match codec_name {
+        "av1" => "libdav1d",
+        name => name,
+    }
+}
+
 /// Initialize a FFmpeg video decoder
 pub fn init_video_codec<'a>(
     codec_options: Option<impl Iterator<Item = (&'a String, &'a String)>>,
@@ -478,8 +489,8 @@ impl Decoder for DecoderFFmpeg {
 
         while !data_in.is_empty() {
             let mut ret = 1;
-            let time_start = Instant::now();
             while ret != 0 {
+                let time_start = Instant::now();
                 ret = unsafe {
                     ffmpeg::av_parser_parse2(
                         parser_ptr,
@@ -497,14 +508,14 @@ impl Decoder for DecoderFFmpeg {
                     panic!("Error while parsing");
                 }
                 data_in = &data_in[ret as usize..];
-            }
-            duration_parse += Instant::now() - time_start;
+                duration_parse += Instant::now() - time_start;
 
-            if img_updated.is_some() {
-                warn!("Skip frame");
-            }
-            unsafe {
-                if (*packet_ptr).size != 0 {
+                // The H.264 parser returns the frame on the last call, with no
+                // input left; the AV1 and VP9 parsers on the call consuming it
+                if unsafe { (*packet_ptr).size } != 0 {
+                    if img_updated.is_some() {
+                        warn!("Skip frame");
+                    }
                     let result = decode(self, img_out_width, img_out_height);
                     img_updated = result.0;
                     decode_timings = result.1;

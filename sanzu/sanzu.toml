@@ -47,6 +47,22 @@ tune = "zerolatency"
 preset = "fast"
 tune = "zerolatency"
 
+[ffmpeg.libsvtav1]
+# SVT-AV1 encodes 4:2:0 only
+pixel_format = "yuv420p"
+# Low delay, constant bitrate; screen content tools need preset 8 or lower
+preset = "8"
+svtav1-params = "pred-struct=1:rc=2:scm=1"
+
+[ffmpeg.libvpx-vp9]
+# yuv444p (VP9 profile 1) keeps colored text sharp
+pixel_format = "yuv444p"
+deadline = "realtime"
+cpu-used = "8"
+lag-in-frames = "0"
+row-mt = "1"
+tune-content = "screen"
+
 [ffmpeg.h264_nvenc]
 #pixel_format = "yuv420p"
 #pixel_format = "yuv444p"

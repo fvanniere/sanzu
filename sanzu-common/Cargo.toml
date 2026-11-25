@@ -1,6 +1,6 @@
 [package]
 name = "sanzu-common"
-version = "0.2.8"
+version = "0.2.17"
 authors = ["Fabrice Desclaux <fabrice.desclaux@cea.fr>"]
 edition = "2018"
 description = "Sanzu helper code"
@@ -19,7 +19,7 @@ log = "0.4"
 prost = "0.11"
 rustls = { version = "0.21.12", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0"
-webpki-roots = "0.23"
+webpki-roots = "0.25"
 x509-parser = "0.15"
 
 [features]

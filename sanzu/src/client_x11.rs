@@ -1,5 +1,5 @@
 use crate::{
-    client_utils::{Area, Client},
+    client_utils::{is_paste_shortcut, Area, Client},
     utils::{ClientArgsConfig, ClipboardConfig, ClipboardSelection},
     utils_x11,
 };
@@ -21,6 +21,7 @@ use x11_clipboard::Clipboard;
 
 use x11rb::{
     connection::{Connection, RequestConnection},
+    properties::{WmSizeHints, WmSizeHintsSpecification},
     protocol::{
         randr::{self, ConnectionExt as _},
         render,
@@ -42,7 +43,18 @@ const KEY_SHIFT: usize = 50;
 const KEY_ALT: usize = 64;
 const KEY_S: usize = 39;
 const KEY_C: usize = 54;
+const KEY_V: usize = 55;
 const KEY_H: usize = 43;
+/// Same physical key, labelled N, on QWERTY, AZERTY and QWERTZ layouts
+const KEY_N: usize = 57;
+
+/// `WM_CLASS` instance and class names, so that window manager rules can
+/// target the client whatever its title
+const WM_CLASS: &[u8] = b"sanzu_client\0Sanzu\0";
+
+/// `_NET_WM_STATE` client message actions
+const NET_WM_STATE_REMOVE: u32 = 0;
+const NET_WM_STATE_ADD: u32 = 1;
 
 /// Get the supported SHM version from the X11 server
 fn check_shm_version<C: Connection>(conn: &C) -> Result<(u16, u16)> {
@@ -56,6 +68,107 @@ fn check_shm_version<C: Connection>(conn: &C) -> Result<(u16, u16)> {
         .reply()
         .context("Error in query shm version reply")?;
     Ok((shm_version.major_version, shm_version.minor_version))
+}
+
+/// A local monitor, as reported by RandR 1.5
+#[derive(Clone, Debug)]
+pub struct Monitor {
+    pub name: String,
+    pub primary: bool,
+    pub position: (i16, i16),
+    pub size: (u16, u16),
+}
+
+impl Monitor {
+    fn contains(&self, point: (i16, i16)) -> bool {
+        let (x, y) = (point.0 as i32, point.1 as i32);
+        let (left, top) = (self.position.0 as i32, self.position.1 as i32);
+        x >= left && x < left + self.size.0 as i32 && y >= top && y < top + self.size.1 as i32
+    }
+}
+
+/// List the local monitors in RandR order (the indexes `xrandr --listmonitors`
+/// prints)
+fn get_monitors<C: Connection>(conn: &C, root: Window) -> Result<Vec<Monitor>> {
+    let version = conn
+        .randr_query_version(1, 5)
+        .context("Error in randr_query_version")?
+        .reply()
+        .context("Error in randr_query_version reply")?;
+    if (version.major_version, version.minor_version) < (1, 5) {
+        return Err(anyhow!(
+            "X11 server supports RandR {}.{}, monitors need 1.5",
+            version.major_version,
+            version.minor_version
+        ));
+    }
+    let reply = conn
+        .randr_get_monitors(root, true)
+        .context("Error in randr_get_monitors")?
+        .reply()
+        .context("Error in randr_get_monitors reply")?;
+    let mut monitors = vec![];
+    for info in reply.monitors {
+        let name = conn
+            .get_atom_name(info.name)
+            .context("Error in get_atom_name")?
+            .reply()
+            .context("Error in get_atom_name reply")?;
+        monitors.push(Monitor {
+            name: String::from_utf8_lossy(&name.name).into_owned(),
+            primary: info.primary,
+            position: (info.x, info.y),
+            size: (info.width, info.height),
+        });
+    }
+    Ok(monitors)
+}
+
+/// Find the monitor named by `selector`: its RandR index or its output name
+pub(crate) fn select_monitor<'a>(monitors: &'a [Monitor], selector: &str) -> Result<&'a Monitor> {
+    let found = match selector.parse::<usize>() {
+        Ok(index) => monitors.get(index),
+        Err(_) => monitors.iter().find(|monitor| monitor.name == selector),
+    };
+    found.with_context(|| {
+        let available = monitors
+            .iter()
+            .enumerate()
+            .map(|(index, monitor)| format!("{index}: {}", monitor.name))
+            .collect::<Vec<String>>()
+            .join(", ");
+        format!("Unknown monitor {selector:?} (available: {available})")
+    })
+}
+
+fn intern_atom<C: Connection>(conn: &C, name: &[u8]) -> Result<Atom> {
+    Ok(conn
+        .intern_atom(false, name)
+        .context("Error in intern_atom")?
+        .reply()
+        .context("Error in intern_atom reply")?
+        .atom)
+}
+
+/// Ask the window manager to add or remove the fullscreen state of `window`
+fn send_fullscreen_state<C: Connection>(
+    conn: &C,
+    root: Window,
+    window: Window,
+    action: u32,
+) -> Result<()> {
+    let wm_state = intern_atom(conn, b"_NET_WM_STATE")?;
+    let wm_full = intern_atom(conn, b"_NET_WM_STATE_FULLSCREEN")?;
+    // Last data field: the request comes from a normal application
+    let event = ClientMessageEvent::new(32, window, wm_state, [action, wm_full, 0, 1, 0]);
+    conn.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )
+    .context("Error in send_event")?;
+    Ok(())
 }
 
 /// Holds information on the local client graphic window
@@ -106,6 +219,12 @@ pub struct ClientInfo {
     pub display_stats: bool,
     /// Bool to trig clipboard send
     pub clipbard_trig: bool,
+    /// The last seen clipboard value has not been sent to the server
+    pub clipboard_pending: bool,
+    /// The user pressed a paste shortcut
+    pub clipboard_paste: bool,
+    /// The user pasted without sending the clipboard
+    pub clipboard_warning: bool,
     /// Sync caps/num/scroll lock
     pub sync_key_locks: bool,
     /// is key lock sync needed
@@ -120,6 +239,8 @@ pub struct ClientInfo {
     pub window_format_id: u32,
     /// Size of the last decoded (remote) frame stored in the pixmap.
     pub frame_size: (u16, u16),
+    /// Is the window fullscreen (not in window mode)
+    pub fullscreen: bool,
 }
 
 fn create_gc<C: Connection>(
@@ -142,7 +263,7 @@ fn setup_window<C: Connection>(
     conn: &C,
     arguments: &ClientArgsConfig,
     screen: &Screen,
-    window_position: (i16, i16),
+    window_position: Option<(i16, i16)>,
     window_size: (u16, u16),
 ) -> Result<Window> {
     let win_id = conn.generate_id().context("Error in generate_id")?;
@@ -163,8 +284,8 @@ fn setup_window<C: Connection>(
         COPY_DEPTH_FROM_PARENT,
         win_id,
         screen.root,
-        window_position.0,
-        window_position.1,
+        window_position.map_or(0, |position| position.0),
+        window_position.map_or(0, |position| position.1),
         window_size.0,
         window_size.1,
         0,
@@ -185,6 +306,52 @@ fn setup_window<C: Connection>(
         .context("Error on change window name")
     {
         err.chain().for_each(|cause| error!(" - due to {}", cause));
+    }
+
+    if let Err(err) = intern_atom(conn, b"_NET_WM_NAME")
+        .and_then(|net_wm_name| Ok((net_wm_name, intern_atom(conn, b"UTF8_STRING")?)))
+        .and_then(|(net_wm_name, utf8_string)| {
+            conn.change_property8(
+                PropMode::REPLACE,
+                win_id,
+                net_wm_name,
+                utf8_string,
+                arguments.title.as_bytes(),
+            )
+            .context("Error on change _NET_WM_NAME")
+        })
+    {
+        err.chain().for_each(|cause| error!(" - due to {}", cause));
+    }
+
+    conn.change_property8(
+        PropMode::REPLACE,
+        win_id,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        WM_CLASS,
+    )
+    .context("Error on change window class")?;
+
+    // A chosen monitor is a user specified geometry: without these hints, the
+    // window manager is free to place the window elsewhere
+    if let Some(position) = window_position {
+        let hints = WmSizeHints {
+            position: Some((
+                WmSizeHintsSpecification::UserSpecified,
+                position.0 as i32,
+                position.1 as i32,
+            )),
+            size: Some((
+                WmSizeHintsSpecification::UserSpecified,
+                window_size.0 as i32,
+                window_size.1 as i32,
+            )),
+            ..Default::default()
+        };
+        hints
+            .set_normal_hints(conn, win_id)
+            .context("Error on set WM_NORMAL_HINTS")?;
     }
 
     if !arguments.window_mode {
@@ -233,10 +400,11 @@ fn new_area<C: Connection>(
     conn: &C,
     arguments: &ClientArgsConfig,
     screen: &Screen,
+    position: Option<(i16, i16)>,
     size: (u16, u16),
 ) -> Result<WindowInfo> {
     let win_id =
-        setup_window(conn, arguments, screen, (0, 0), size).context("Error in setup_window")?;
+        setup_window(conn, arguments, screen, position, size).context("Error in setup_window")?;
 
     let pixmap = conn.generate_id().context("Error in x11rb generate_id")?;
 
@@ -274,8 +442,20 @@ pub fn init_x11rb(
     let setup = conn.setup();
     let screen = &setup.roots[screen_num];
 
-    let screen_width = screen.width_in_pixels;
-    let screen_height = screen.height_in_pixels;
+    // Without --monitor, the window spans the whole X11 screen as before
+    let monitor = match &arguments.monitor {
+        Some(selector) => {
+            let monitors = get_monitors(&conn, screen.root).context("Cannot list monitors")?;
+            let monitor = select_monitor(&monitors, selector)?.clone();
+            info!("Open on monitor {:?}", monitor);
+            Some(monitor)
+        }
+        None => None,
+    };
+    let (screen_width, screen_height) = match &monitor {
+        Some(monitor) => monitor.size,
+        None => (screen.width_in_pixels, screen.height_in_pixels),
+    };
 
     let (width, height) = if let Some((width, height)) = server_size {
         (width, height)
@@ -361,8 +541,14 @@ pub fn init_x11rb(
         .check()
         .context("Error in randr_select_input check")?;
 
-    let window_info =
-        new_area(&conn, arguments, screen, (width, height)).context("Error in new_area")?;
+    let window_info = new_area(
+        &conn,
+        arguments,
+        screen,
+        monitor.map(|monitor| monitor.position),
+        (width, height),
+    )
+    .context("Error in new_area")?;
 
     if arguments.grab_keyboard {
         conn.grab_keyboard(
@@ -444,6 +630,9 @@ pub fn init_x11rb(
         skip_clipboard_clipboard,
         display_stats: false,
         clipbard_trig: false,
+        clipboard_pending: false,
+        clipboard_paste: false,
+        clipboard_warning: false,
         sync_key_locks: arguments.sync_key_locks,
         sync_key_locks_needed: arguments.sync_key_locks,
         areas: vec![],
@@ -451,6 +640,7 @@ pub fn init_x11rb(
         bgra_format_id,
         window_format_id,
         frame_size: (width, height),
+        fullscreen: !arguments.window_mode,
     };
 
     Ok(Box::new(client_info))
@@ -604,6 +794,71 @@ fn shape_window(client_info: &mut ClientInfo, areas: &HashMap<usize, Area>) -> R
         .free_pixmap(pixmap)
         .context("Error in free_pixmap")?;
 
+    Ok(())
+}
+
+/// Move the window to the monitor after the one holding its center
+///
+/// The window manager refuses to move a fullscreen window: leave fullscreen,
+/// move, then fullscreen again, on the new monitor. The window manager handles
+/// the three requests in order.
+fn move_to_next_monitor(client: &mut ClientInfo) -> Result<()> {
+    let monitors = get_monitors(&client.conn, client.root).context("Cannot list monitors")?;
+    if monitors.len() < 2 {
+        info!("Single monitor, nothing to move to");
+        return Ok(());
+    }
+
+    let size = client.window_info.size;
+    let center = client
+        .conn
+        .translate_coordinates(
+            client.window_info.window,
+            client.root,
+            (size.0 / 2) as i16,
+            (size.1 / 2) as i16,
+        )
+        .context("Error in translate_coordinates")?
+        .reply()
+        .context("Error in translate_coordinates reply")?;
+    let current = monitors
+        .iter()
+        .position(|monitor| monitor.contains((center.dst_x, center.dst_y)))
+        .unwrap_or(0);
+    let target = &monitors[(current + 1) % monitors.len()];
+    info!("Move to monitor {:?}", target);
+
+    let size = if client.fullscreen {
+        target.size
+    } else {
+        (size.0.min(target.size.0), size.1.min(target.size.1))
+    };
+    if client.fullscreen {
+        send_fullscreen_state(
+            &client.conn,
+            client.root,
+            client.window_info.window,
+            NET_WM_STATE_REMOVE,
+        )?;
+    }
+    let values = ConfigureWindowAux::new()
+        .x(target.position.0 as i32)
+        .y(target.position.1 as i32)
+        .width(size.0 as u32)
+        .height(size.1 as u32);
+    client
+        .conn
+        .configure_window(client.window_info.window, &values)
+        .context("Error in configure_window")?;
+    if client.fullscreen {
+        send_fullscreen_state(
+            &client.conn,
+            client.root,
+            client.window_info.window,
+            NET_WM_STATE_ADD,
+        )?;
+    }
+    client.conn.flush().context("Error in x11rb flush")?;
     Ok(())
 }
 
@@ -858,6 +1113,9 @@ impl Client for ClientInfo {
     }
 
     fn set_clipboard(&mut self, data: &str) -> Result<()> {
+        // The local clipboard now matches the remote one
+        self.clipboard_pending = false;
+
         /* Set *both* clipboards (primary and clipboard) */
         *self.skip_clipboard_clipboard.lock().unwrap() += 1;
         utils_x11::set_clipboard(&self.clipboard, 0, data).context("Error in set_clipboard")?;
@@ -964,8 +1222,8 @@ impl Client for ClientInfo {
                         }
                     }
 
-                    // If Ctrl alt shift c => Trig clipboard event
-                    if event.detail == KEY_C as u8 {
+                    // If Ctrl alt shift c or v => Trig clipboard event
+                    if event.detail == KEY_C as u8 || event.detail == KEY_V as u8 {
                         // Ctrl Shift Alt
                         if self.keys_state[KEY_CTRL]
                             && self.keys_state[KEY_SHIFT]
@@ -973,6 +1231,10 @@ impl Client for ClientInfo {
                         {
                             self.clipbard_trig = true;
                         }
+                    }
+
+                    if is_paste_shortcut(&self.keys_state, event.detail as usize) {
+                        self.clipboard_paste = true;
                     }
 
                     // If Ctrl alt shift h => toggle grab keyboard
@@ -992,6 +1254,19 @@ impl Client for ClientInfo {
 
                             self.grab_keyboard = !self.grab_keyboard;
                             info!("Toggle ungrab Keyboard {}", self.grab_keyboard);
+                        }
+                    }
+
+                    // If Ctrl alt shift n => move to the next monitor
+                    if event.detail == KEY_N as u8 {
+                        // Ctrl Shift Alt
+                        if self.keys_state[KEY_CTRL]
+                            && self.keys_state[KEY_SHIFT]
+                            && self.keys_state[KEY_ALT]
+                        {
+                            if let Err(err) = move_to_next_monitor(self) {
+                                warn!("Cannot move to the next monitor: {:?}", err);
+                            }
                         }
                     }
 
@@ -1083,6 +1358,7 @@ impl Client for ClientInfo {
         /* Get clipboard events */
         if let Some(data) = get_clipboard_events(&self.clipboard_event_receiver) {
             self.clipboard_last_value = Some(data);
+            self.clipboard_pending = true;
         }
 
         events.extend(last_move);
@@ -1111,10 +1387,16 @@ impl Client for ClientInfo {
                         msg: Some(tunnel::message_client::Msg::Clipboard(eventclipboard)),
                     };
                     events.push(clipboard_msg);
+                    self.clipboard_pending = false;
                 }
                 self.clipbard_trig = false;
+                if self.clipboard_paste && self.clipboard_pending {
+                    self.clipboard_warning = true;
+                }
             }
         }
+
+        self.clipboard_paste = false;
 
         Ok(tunnel::MessagesClient {
             msgs: events,
@@ -1126,8 +1408,53 @@ impl Client for ClientInfo {
         self.display_stats
     }
 
+    fn clipboard_warning(&mut self) -> bool {
+        std::mem::take(&mut self.clipboard_warning)
+    }
+
     fn printfile(&self, file: &str) -> Result<()> {
         info!("Print file {:?}", file);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitors() -> Vec<Monitor> {
+        vec![
+            Monitor {
+                name: "DP-1".to_owned(),
+                primary: true,
+                position: (0, 0),
+                size: (2560, 1440),
+            },
+            Monitor {
+                name: "HDMI-A-1".to_owned(),
+                primary: false,
+                position: (2560, 0),
+                size: (1920, 1080),
+            },
+        ]
+    }
+
+    #[test]
+    fn select_monitor_by_index_or_name() {
+        let monitors = monitors();
+        assert_eq!(select_monitor(&monitors, "1").unwrap().name, "HDMI-A-1");
+        assert_eq!(select_monitor(&monitors, "DP-1").unwrap().position, (0, 0));
+        let err = select_monitor(&monitors, "2").unwrap_err().to_string();
+        assert!(err.contains("0: DP-1, 1: HDMI-A-1"), "{err}");
+        assert!(select_monitor(&monitors, "eDP-1").is_err());
+    }
+
+    #[test]
+    fn monitor_contains_its_own_area_only() {
+        let monitors = monitors();
+        assert!(monitors[0].contains((2559, 1439)));
+        assert!(!monitors[0].contains((2560, 0)));
+        assert!(monitors[1].contains((2560, 0)));
+        assert!(!monitors[1].contains((2560, 1080)));
     }
 }
