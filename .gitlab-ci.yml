@@ -4,6 +4,9 @@ stages:
 
 variables:
   CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  # Attestation de provenance SLSA des artefacts par le runner (skill sbom).
+  RUNNER_GENERATE_ARTIFACTS_METADATA: "true"
+  SLSA_PROVENANCE_SCHEMA_VERSION: "v1"
   DEBIAN_PACKAGE_DIR: dist/debian-trixie
   GENERIC_PACKAGE_NAME: sanzu-debian-trixie
 
@@ -37,11 +40,23 @@ package:debian:trixie:
     - cp target/debian/*.deb "${DEBIAN_PACKAGE_DIR}/"
     - test "$(find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' | wc -l)" -eq 3
     - for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do dpkg-deb --info "${package}" >/dev/null; done
+    # SBOM CycloneDX et manifeste de release (skill sbom) inclus dans le paquet
+    # sanzu ; vue de construction : paquets Debian du build (la chaîne Rust
+    # vient de l'image rust:1-trixie, relevée hors paquets).
+    - >-
+      SBOM_CARRIER=sanzu
+      SBOM_BUILD_ROOTS="clang, cmake, g++, libavdevice-dev, libavfilter-dev, libavformat-dev,
+      libavutil-dev, libclang-dev, libdbus-1-dev, libkrb5-dev, libpam0g-dev, libx264-dev,
+      libxcb-render0-dev, libxcb-shape0-dev, libxcb-xfixes0-dev, libxdamage-dev, libxext-dev,
+      libasound2-dev, pkg-config, protobuf-compiler"
+      bash ci/sbom-inject.sh "${DEBIAN_PACKAGE_DIR}"
     - find "${DEBIAN_PACKAGE_DIR}" -maxdepth 1 -name '*.deb' -print
   artifacts:
     name: "sanzu-debian-trixie-${CI_COMMIT_REF_SLUG}"
     paths:
       - dist/debian-trixie/*.deb
+      - dist/debian-trixie/*.cdx.json
+      - dist/debian-trixie/*.sbom-manifest.json
     expire_in: 30 days
   rules:
     - if: '$CI_COMMIT_TAG =~ /^sanzu-v[0-9]+\.[0-9]+\.[0-9]+$/'
@@ -68,7 +83,8 @@ publish:debian:trixie:
       fi
       export REGISTRY_VERSION
     - |
-      for package in "${DEBIAN_PACKAGE_DIR}"/*.deb; do
+      # SBOM et manifeste d'abord, les .deb ensuite.
+      for package in "${DEBIAN_PACKAGE_DIR}"/*.cdx.json "${DEBIAN_PACKAGE_DIR}"/*.sbom-manifest.json "${DEBIAN_PACKAGE_DIR}"/*.deb; do
         filename="$(basename "${package}")"
         curl --fail-with-body --location \
           --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
