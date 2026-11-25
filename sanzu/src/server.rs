@@ -360,6 +360,7 @@ pub fn run_server(config: &ConfigServer, arguments: &ServerArgsConfig) -> Result
     let mut fido = match fido_info {
         Some(info) if arguments.fido => Some(
             FidoServer::create(&info, arguments.fido_virtual_id.as_deref())
+                .and_then(FidoServer::into_link)
                 .map_err(|err| send_server_err_event(&mut sock, err))?,
         ),
         Some(_) => {

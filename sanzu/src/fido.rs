@@ -19,6 +19,11 @@ use std::{
     convert::TryInto,
     io::{Read, Write},
     process::{Command, Stdio},
+    sync::{
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+        Arc, Mutex,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -28,6 +33,7 @@ const MAX_REPORTS_PER_CYCLE: usize = 64;
 const FIDO_USAGE_PAGE: u16 = 0xf1d0;
 const FIDO_USAGE: u16 = 0x0001;
 const CTAPHID_CBOR: u8 = 0x10;
+const CTAPHID_INIT: u8 = 0x06;
 const CTAP_GET_INFO: u8 = 0x04;
 const CTAP_CLIENT_PIN: u8 = 0x06;
 const CTAP_MAKE_CREDENTIAL: u8 = 0x01;
@@ -113,14 +119,40 @@ pub struct FidoClient {
     pending_get_info: HashSet<u32>,
     proxy_secret: SecretKey,
     pin_session: Option<PinSession>,
+    /// Forward everything untouched: no GetInfo rewrite, no ClientPIN broker,
+    /// no proof translation. The remote session then talks to the raw
+    /// authenticator and prompts for the PIN itself, which is what this
+    /// forwarding did before the local broker existed. Kept as a diagnostic:
+    /// it isolates the broker from the rest of the path in one flag.
+    passthrough: bool,
+    /// Trim the advertised algorithm list down to ES256. Some platform CBOR
+    /// parsers reject a GetInfo whose algorithm identifiers they do not all
+    /// recognize, and refuse the authenticator before sending any command.
+    es256_only: bool,
 }
 
 impl FidoClient {
-    pub fn open(requested_path: Option<&str>) -> Result<Self> {
+    pub fn open(requested_path: Option<&str>, passthrough: bool, es256_only: bool) -> Result<Self> {
         #[cfg(any(target_os = "linux", windows))]
         {
             let api = hidapi::HidApi::new().context("Cannot enumerate HID devices")?;
             let selector = requested_path.map(FidoSelector::parse);
+            debug!("Looking for a FIDO HID interface with selector {selector:?}");
+            if log_enabled!(log::Level::Debug) {
+                for device in api.device_list() {
+                    if device.usage_page() == FIDO_USAGE_PAGE && device.usage() == FIDO_USAGE {
+                        debug!(
+                            "FIDO HID interface {:04x}:{:04x} manufacturer {:?} product {:?} serial {:?} at {}",
+                            device.vendor_id(),
+                            device.product_id(),
+                            device.manufacturer_string().unwrap_or_default(),
+                            device.product_string().unwrap_or_default(),
+                            device.serial_number().unwrap_or_default(),
+                            device.path().to_string_lossy()
+                        );
+                    }
+                }
+            }
             let mut matches = api
                 .device_list()
                 .filter(|device| {
@@ -153,6 +185,7 @@ impl FidoClient {
                     }
                 })
                 .collect::<Vec<_>>();
+            debug!("{} FIDO HID interface(s) match the selector", matches.len());
 
             if matches.is_empty() {
                 return Err(if let Some(selector) = requested_path {
@@ -206,8 +239,16 @@ impl FidoClient {
                 .set_blocking_mode(false)
                 .context("Cannot make FIDO HID device non-blocking")?;
             info!(
-                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}",
-                info.product_name, info.vendor_id, info.product_id, path
+                "Forwarding FIDO authenticator {:?} ({:04x}:{:04x}) at {}{}",
+                info.product_name,
+                info.vendor_id,
+                info.product_id,
+                path,
+                if passthrough {
+                    " in passthrough mode: the remote session asks for the PIN"
+                } else {
+                    ""
+                }
             );
             return Ok(Self {
                 device,
@@ -218,12 +259,14 @@ impl FidoClient {
                 pending_get_info: HashSet::new(),
                 proxy_secret: SecretKey::random(&mut OsRng),
                 pin_session: None,
+                passthrough,
+                es256_only,
             });
         }
 
         #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = requested_path;
+            let _ = (requested_path, passthrough, es256_only);
             Err(anyhow!(
                 "FIDO forwarding is supported only by Linux and Windows clients"
             ))
@@ -242,27 +285,29 @@ impl FidoClient {
                 let Some(report) = read_hid_report(&self.device, 0)? else {
                     break;
                 };
+                trace!("Authenticator report: {}", describe_report(&report, false));
                 if let Some(mut message) = self.responses.push(&report)? {
+                    debug!(
+                        "Authenticator answered {}",
+                        describe_message(&message, false)
+                    );
+                    trace_payload("Authenticator payload", &message.payload, false);
                     if message.command == CTAPHID_CBOR && self.pending_get_info.remove(&message.cid)
                     {
-                        advertise_local_pin_broker(&mut message.payload)?;
+                        debug!("Rewriting the GetInfo answer for cid 0x{:08x}", message.cid);
+                        advertise_local_pin_broker(&mut message.payload, self.es256_only)?;
                         info!("FIDO GetInfo response exposes the local PIN broker");
+                        trace_payload("Rewritten payload", &message.payload, false);
                     }
-                    let reports = fragment_message(&message)?;
-                    debug_ctaphid_message(
-                        "authenticator -> server",
-                        &message,
-                        CborPayloadKind::Response,
-                        reports.len(),
-                    );
-                    self.output.extend(reports);
+                    self.output.extend(fragment_message(&message)?);
                 }
             }
             let reports = self.drain_output();
             if !reports.is_empty() {
                 debug!(
-                    "FIDO client queued {} HID report(s) for the server",
-                    reports.len()
+                    "Forwarding {} FIDO report(s) to the remote session ({} still queued)",
+                    reports.len(),
+                    self.output.len()
                 );
             }
             return Ok(reports);
@@ -278,7 +323,7 @@ impl FidoClient {
         }
         if !reports.is_empty() {
             debug!(
-                "FIDO client received {} HID report(s) from the server",
+                "Received {} FIDO report(s) from the remote session",
                 reports.len()
             );
         }
@@ -286,6 +331,7 @@ impl FidoClient {
             validate_report(&report)?;
             #[cfg(any(target_os = "linux", windows))]
             {
+                trace!("Remote report: {}", describe_report(&report, true));
                 if let Some(message) = self.requests.push(&report)? {
                     self.handle_remote_message(message)?;
                 }
@@ -296,13 +342,13 @@ impl FidoClient {
 
     #[cfg(any(target_os = "linux", windows))]
     fn handle_remote_message(&mut self, mut message: CtapMessage) -> Result<()> {
-        debug_ctaphid_message(
-            "server -> client",
-            &message,
-            CborPayloadKind::Request,
-            ctaphid_report_count(message.payload.len()),
-        );
+        debug!("Remote session sent {}", describe_message(&message, true));
+        if self.passthrough {
+            debug!("Passthrough mode: forwarding to the authenticator untouched");
+            return self.write_message(&message);
+        }
         if message.command != CTAPHID_CBOR || message.payload.is_empty() {
+            debug!("Forwarding the message to the authenticator untouched");
             return self.write_message(&message);
         }
 
@@ -313,10 +359,21 @@ impl FidoClient {
                 self.write_message(&message)
             }
             CTAP_CLIENT_PIN => {
-                if let Ok(map) = decode_map(&message.payload[1..]) {
-                    if let Ok(subcommand) = map_u8(&map, 2) {
-                        info!("FIDO request: ClientPIN subcommand 0x{subcommand:02x}");
+                match decode_map(&message.payload[1..]) {
+                    Ok(map) => {
+                        if let Ok(subcommand) = map_u8(&map, 2) {
+                            info!(
+                                "FIDO request: ClientPIN {} (0x{subcommand:02x})",
+                                client_pin_subcommand_name(subcommand)
+                            );
+                        }
+                        debug!(
+                            "ClientPIN request: protocol {:?}, CBOR keys {:?}",
+                            map_u8(&map, 1).ok(),
+                            cbor_integer_keys(&map)
+                        );
                     }
+                    Err(err) => debug!("ClientPIN request is not a decodable CBOR map: {err:#}"),
                 }
                 let response = match self.handle_client_pin(message.cid, &message.payload[1..]) {
                     Ok(response) => response,
@@ -325,6 +382,12 @@ impl FidoClient {
                         ctap_error(CTAP2_ERR_OPERATION_DENIED)
                     }
                 };
+                let status = response.first().copied().unwrap_or(0xff);
+                debug!(
+                    "Local PIN broker answers with CTAP status 0x{status:02x} ({}), {} byte(s)",
+                    ctap_status_name(status),
+                    response.len()
+                );
                 self.queue_cbor_response(message.cid, response)
             }
             CTAP_MAKE_CREDENTIAL | CTAP_GET_ASSERTION => {
@@ -335,7 +398,13 @@ impl FidoClient {
                 };
                 info!("FIDO request: {operation}");
                 match self.translate_pin_proof(&mut message.payload) {
-                    Ok(()) => self.write_message(&message),
+                    Ok(()) => {
+                        debug!(
+                            "Forwarding {operation} to the authenticator ({} byte payload)",
+                            message.payload.len()
+                        );
+                        self.write_message(&message)
+                    }
                     Err(err) => {
                         warn!("Rejected a remote FIDO proof: {err:#}");
                         self.queue_cbor_response(
@@ -345,7 +414,13 @@ impl FidoClient {
                     }
                 }
             }
-            _ => self.write_message(&message),
+            other => {
+                debug!(
+                    "Forwarding CTAP command {} (0x{other:02x}) to the authenticator untouched",
+                    ctap_command_name(other)
+                );
+                self.write_message(&message)
+            }
         }
     }
 
@@ -356,10 +431,12 @@ impl FidoClient {
         let subcommand = map_u8(&map, 2)?;
         let action = client_pin_action(subcommand);
         debug!(
-            "FIDO PIN broker classified ClientPIN subcommand 0x{subcommand:02x} as {action:?} on channel 0x{cid:08x}"
+            "Local PIN broker handles {} (0x{subcommand:02x}) as {action:?}",
+            client_pin_subcommand_name(subcommand)
         );
         match action {
             ClientPinAction::KeyAgreement => {
+                debug!("Publishing the broker P-256 public key to the remote session");
                 let key = cose_public_key(&self.proxy_secret.public_key());
                 Ok(ctap_success(map_of([(1, key)]))?)
             }
@@ -382,7 +459,12 @@ impl FidoClient {
             (1, Value::Integer(1)),
             (2, Value::Integer(CLIENT_PIN_GET_PIN_RETRIES as i128)),
         ]))?;
-        self.physical_transact(cid, request)
+        let response = self.physical_transact(cid, request)?;
+        match successful_map(&response, "PIN retries").and_then(|map| map_u8(&map, 3)) {
+            Ok(retries) => debug!("The authenticator reports {retries} PIN attempt(s) left"),
+            Err(err) => debug!("Relaying an unreadable PIN retry answer: {err:#}"),
+        }
+        Ok(response)
     }
 
     #[cfg(any(target_os = "linux", windows))]
@@ -401,6 +483,7 @@ impl FidoClient {
                 DEFAULT_UV_RETRIES
             }
         };
+        debug!("Answering the UV retry counter with {retries} attempt(s) left");
         Ok(ctap_success(map_of([(
             5,
             Value::Integer(retries as i128),
@@ -427,10 +510,15 @@ impl FidoClient {
             return Err(anyhow!("Unsupported ClientPIN permission set"));
         }
         let rp_id = map_text(request, 10)?.to_owned();
+        debug!("Remote session asks for a token on {rp_id:?} with permissions 0x{permissions:02x}");
         let remote_key = parse_cose_public(map_value(request, 3)?)?;
         let remote_secret = shared_secret(&self.proxy_secret, &remote_key);
 
         let physical_token = self.obtain_physical_pin_token(cid)?;
+        debug!(
+            "Binding a fresh proxy token to {rp_id:?} for {} s",
+            PIN_TOKEN_LIFETIME.as_secs()
+        );
         let mut proxy_token = Zeroizing::new(vec![0u8; 32]);
         OsRng.fill_bytes(&mut proxy_token);
         let encrypted = aes_cbc_encrypt(&remote_secret[..], &proxy_token)?;
@@ -454,7 +542,12 @@ impl FidoClient {
         for attempt in 1..=3 {
             debug!("FIDO PIN broker starting local PIN attempt {attempt}/3");
             info!("FIDO local PIN broker is opening pinentry on the client");
+            debug!("Local PIN prompt, attempt {attempt} of 3");
+            // `pin` is a Zeroizing<String> that is never formatted, logged or
+            // derived into anything that is: only its SHA-256 prefix, encrypted
+            // under the session key, leaves this function.
             let pin = prompt_for_pin()?;
+            debug!("pinentry returned a PIN; the value itself is never logged");
             let physical_secret = SecretKey::random(&mut OsRng);
             let agreement_request = encode_client_pin(map_of([
                 (1, Value::Integer(1)),
@@ -475,7 +568,7 @@ impl FidoClient {
             ]))?;
             let token_response = self.physical_transact(cid, token_request)?;
             if token_response.first() == Some(&CTAP2_ERR_PIN_INVALID) {
-                debug!("FIDO authenticator rejected local PIN attempt {attempt}/3 as invalid");
+                debug!("The authenticator rejected the PIN on attempt {attempt} of 3");
                 continue;
             }
             let token_map = successful_map(&token_response, "physical PIN token")?;
@@ -500,7 +593,7 @@ impl FidoClient {
         // not require a broker session.
         if !map.contains_key(&Value::Integer(auth_key)) {
             debug!(
-                "FIDO {} request has no PIN/UV proof; forwarding it without broker translation",
+                "{} carries no pinUvAuthParam; forwarding it without a broker session",
                 ctap_command_name(command)
             );
             return Ok(());
@@ -536,6 +629,17 @@ impl FidoClient {
             ),
             _ => return Err(anyhow!("Unsupported PIN-authenticated command")),
         };
+        debug!(
+            "Translating a {} proof for {rp_id:?} (session {:?}, permissions 0x{:02x}, token {})",
+            ctap_command_name(command),
+            session.rp_id,
+            session.permissions,
+            if consumes_token {
+                "consumed"
+            } else {
+                "kept for silent assertions"
+            }
+        );
         if session.permissions & permission == 0 || session.rp_id != rp_id {
             return Err(anyhow!("PIN token permission or relying party mismatch"));
         }
@@ -561,41 +665,51 @@ impl FidoClient {
 
     #[cfg(any(target_os = "linux", windows))]
     fn physical_transact(&mut self, cid: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let sensitive = payload.first() == Some(&CTAP_CLIENT_PIN);
+        if let Some(subcommand) = payload
+            .get(1..)
+            .and_then(|cbor| decode_map(cbor).ok())
+            .and_then(|map| map_u8(&map, 2).ok())
+        {
+            debug!(
+                "Broker to authenticator: ClientPIN {} (0x{subcommand:02x}) on cid 0x{cid:08x}",
+                client_pin_subcommand_name(subcommand)
+            );
+        }
+        trace_payload("Broker request", &payload, sensitive);
         let started_at = Instant::now();
         self.write_message(&CtapMessage {
             cid,
             command: CTAPHID_CBOR,
             payload,
         })?;
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = started_at + Duration::from_secs(10);
         while Instant::now() < deadline {
             let Some(report) = read_hid_report(&self.device, 100)? else {
                 continue;
             };
             if let Some(message) = self.responses.push(&report)? {
                 if message.cid == cid && message.command == CTAPHID_CBOR {
-                    debug_ctaphid_message(
-                        "authenticator -> local PIN broker",
-                        &message,
-                        CborPayloadKind::Response,
-                        ctaphid_report_count(message.payload.len()),
-                    );
+                    let status = message.payload.first().copied().unwrap_or(0xff);
                     debug!(
-                        "FIDO local authenticator transaction completed in {} ms",
+                        "Authenticator answered the broker with CTAP status 0x{status:02x} ({}) in {} ms",
+                        ctap_status_name(status),
                         started_at.elapsed().as_millis()
                     );
+                    trace_payload("Broker answer", &message.payload, sensitive);
                     return Ok(message.payload);
                 }
-                let reports = fragment_message(&message)?;
-                debug_ctaphid_message(
-                    "authenticator -> server (interleaved)",
-                    &message,
-                    CborPayloadKind::Response,
-                    reports.len(),
+                debug!(
+                    "Queuing an unrelated answer while the broker waits: {}",
+                    describe_message(&message, false)
                 );
-                self.output.extend(reports);
+                self.output.extend(fragment_message(&message)?);
             }
         }
+        debug!(
+            "No broker answer on cid 0x{cid:08x} after {} ms",
+            started_at.elapsed().as_millis()
+        );
         Err(anyhow!(
             "Timed out while talking to the local authenticator"
         ))
@@ -644,7 +758,7 @@ impl FidoClient {
             .as_ref()
             .is_some_and(|session| session.expires_at <= Instant::now())
         {
-            debug!("FIDO PIN broker session expired");
+            debug!("The local FIDO PIN session expired; dropping the proxy token");
             self.pin_session = None;
         }
     }
@@ -876,6 +990,235 @@ fn write_hid_report(device: &hidapi::HidDevice, report: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Human-readable CTAPHID transport command, for the RUST_LOG=debug traces.
+#[cfg(any(target_os = "linux", windows))]
+fn ctaphid_command_name(command: u8) -> &'static str {
+    match command {
+        0x03 => "MSG",
+        0x08 => "WINK",
+        0x0c => "LOCK",
+        CTAPHID_INIT => "INIT",
+        CTAPHID_CBOR => "CBOR",
+        0x11 => "KEEPALIVE",
+        0x3b => "PING",
+        0x3e => "CANCEL",
+        0x3f => "ERROR",
+        _ => "vendor/unknown",
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn ctap_command_name(command: u8) -> &'static str {
+    match command {
+        CTAP_MAKE_CREDENTIAL => "MakeCredential",
+        CTAP_GET_ASSERTION => "GetAssertion",
+        CTAP_GET_INFO => "GetInfo",
+        CTAP_CLIENT_PIN => "ClientPIN",
+        0x07 => "Reset",
+        0x08 => "GetNextAssertion",
+        0x09 => "BioEnrollment",
+        0x0a => "CredentialManagement",
+        0x0b => "Selection",
+        0x0c => "LargeBlobs",
+        0x0d => "Config",
+        _ => "unknown",
+    }
+}
+
+/// The CTAP status codes a forwarded session realistically runs into. An
+/// authenticator refusing a command it does not implement answers
+/// CTAP1_ERR_INVALID_COMMAND, which is the signature of a platform using a
+/// feature the physical key does not have.
+#[cfg(any(target_os = "linux", windows))]
+fn ctap_status_name(status: u8) -> &'static str {
+    match status {
+        CTAP2_OK => "OK",
+        0x01 => "CTAP1_ERR_INVALID_COMMAND",
+        0x02 => "CTAP1_ERR_INVALID_PARAMETER",
+        0x03 => "CTAP1_ERR_INVALID_LENGTH",
+        0x04 => "CTAP1_ERR_INVALID_SEQ",
+        0x05 => "CTAP1_ERR_TIMEOUT",
+        0x06 => "CTAP1_ERR_CHANNEL_BUSY",
+        0x0a => "CTAP1_ERR_LOCK_REQUIRED",
+        0x0b => "CTAP1_ERR_INVALID_CHANNEL",
+        0x11 => "CTAP2_ERR_CBOR_UNEXPECTED_TYPE",
+        0x12 => "CTAP2_ERR_INVALID_CBOR",
+        0x14 => "CTAP2_ERR_MISSING_PARAMETER",
+        0x15 => "CTAP2_ERR_LIMIT_EXCEEDED",
+        0x19 => "CTAP2_ERR_CREDENTIAL_EXCLUDED",
+        0x21 => "CTAP2_ERR_PROCESSING",
+        0x22 => "CTAP2_ERR_INVALID_CREDENTIAL",
+        0x23 => "CTAP2_ERR_USER_ACTION_PENDING",
+        0x24 => "CTAP2_ERR_OPERATION_PENDING",
+        0x25 => "CTAP2_ERR_NO_OPERATIONS",
+        0x26 => "CTAP2_ERR_UNSUPPORTED_ALGORITHM",
+        CTAP2_ERR_OPERATION_DENIED => "CTAP2_ERR_OPERATION_DENIED",
+        0x28 => "CTAP2_ERR_KEY_STORE_FULL",
+        0x2b => "CTAP2_ERR_UNSUPPORTED_OPTION",
+        0x2c => "CTAP2_ERR_INVALID_OPTION",
+        0x2d => "CTAP2_ERR_KEEPALIVE_CANCEL",
+        0x2e => "CTAP2_ERR_NO_CREDENTIALS",
+        0x2f => "CTAP2_ERR_USER_ACTION_TIMEOUT",
+        0x30 => "CTAP2_ERR_NOT_ALLOWED",
+        CTAP2_ERR_PIN_INVALID => "CTAP2_ERR_PIN_INVALID",
+        0x32 => "CTAP2_ERR_PIN_BLOCKED",
+        CTAP2_ERR_PIN_AUTH_INVALID => "CTAP2_ERR_PIN_AUTH_INVALID",
+        0x34 => "CTAP2_ERR_PIN_AUTH_BLOCKED",
+        0x35 => "CTAP2_ERR_PIN_NOT_SET",
+        0x36 => "CTAP2_ERR_PUAT_REQUIRED",
+        0x37 => "CTAP2_ERR_PIN_POLICY_VIOLATION",
+        0x39 => "CTAP2_ERR_REQUEST_TOO_LARGE",
+        0x3a => "CTAP2_ERR_ACTION_TIMEOUT",
+        0x3b => "CTAP2_ERR_UP_REQUIRED",
+        0x3c => "CTAP2_ERR_UV_BLOCKED",
+        0x3d => "CTAP2_ERR_INTEGRITY_FAILURE",
+        CTAP2_ERR_INVALID_SUBCOMMAND => "CTAP2_ERR_INVALID_SUBCOMMAND",
+        0x3f => "CTAP2_ERR_UNAUTHORIZED_PERMISSION",
+        0x7f => "CTAP1_ERR_OTHER",
+        _ => "unknown",
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn client_pin_subcommand_name(subcommand: u8) -> &'static str {
+    match subcommand {
+        CLIENT_PIN_GET_PIN_RETRIES => "getPINRetries",
+        CLIENT_PIN_GET_KEY_AGREEMENT => "getKeyAgreement",
+        0x03 => "setPIN",
+        0x04 => "changePIN",
+        CLIENT_PIN_GET_PIN_TOKEN => "getPinToken",
+        CLIENT_PIN_TOKEN_USING_PIN => "getPinUvAuthTokenUsingPinWithPermissions",
+        CLIENT_PIN_GET_UV_RETRIES => "getUVRetries",
+        CLIENT_PIN_TOKEN_USING_UV => "getPinUvAuthTokenUsingUvWithPermissions",
+        _ => "unknown",
+    }
+}
+
+/// CTAPHID_INIT carries the platform's 8-byte nonce, echoed by the
+/// authenticator along with the channel it allocates. A platform that keeps
+/// re-issuing INIT without moving on to CBOR is rejecting these answers, and
+/// a nonce that does not come back unchanged is the usual reason -- so the
+/// nonce and the allocated channel are the two things worth printing. Neither
+/// is a secret: both travel in clear on the USB wire.
+#[cfg(any(target_os = "linux", windows))]
+fn describe_init(payload: &[u8], is_request: bool) -> Option<String> {
+    if is_request && payload.len() == 8 {
+        return Some(format!("nonce {}", hex(payload)));
+    }
+    if !is_request && payload.len() >= 17 {
+        return Some(format!(
+            "nonce {}, allocated cid 0x{:08x}, CTAPHID {}, device {}.{}.{}, caps 0x{:02x}",
+            hex(&payload[..8]),
+            u32::from_be_bytes(payload[8..12].try_into().unwrap()),
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+            payload[16]
+        ));
+    }
+    None
+}
+
+/// One-line summary of an assembled CTAPHID message. `is_request` tells apart a
+/// CBOR command byte from a CBOR status byte, which share the first payload
+/// position in the two directions.
+#[cfg(any(target_os = "linux", windows))]
+fn describe_message(message: &CtapMessage, is_request: bool) -> String {
+    let mut description = format!(
+        "cid 0x{:08x} {} ({} byte payload)",
+        message.cid,
+        ctaphid_command_name(message.command),
+        message.payload.len()
+    );
+    if message.command == CTAPHID_CBOR {
+        match (is_request, message.payload.first()) {
+            (true, Some(&command)) => description.push_str(&format!(
+                ", {} (0x{command:02x})",
+                ctap_command_name(command)
+            )),
+            (false, Some(&status)) => description.push_str(&format!(
+                ", status 0x{status:02x} ({})",
+                ctap_status_name(status)
+            )),
+            (_, None) => {}
+        }
+    } else if message.command == CTAPHID_INIT {
+        if let Some(init) = describe_init(&message.payload, is_request) {
+            description.push_str(&format!(", {init}"));
+        }
+    }
+    description
+}
+
+/// Same summary from a single 64-byte report, without reassembling anything.
+/// Used where no assembler state is available, on the virtual device side.
+#[cfg(any(target_os = "linux", windows))]
+fn describe_report(report: &[u8], is_request: bool) -> String {
+    if report.len() != FIDO_REPORT_SIZE {
+        return format!("malformed report of {} byte(s)", report.len());
+    }
+    let cid = u32::from_be_bytes(report[..4].try_into().unwrap());
+    if report[4] & 0x80 == 0 {
+        return format!("cid 0x{cid:08x} continuation, sequence {}", report[4]);
+    }
+    let command = report[4] & 0x7f;
+    let length = u16::from_be_bytes([report[5], report[6]]);
+    let mut description = format!(
+        "cid 0x{cid:08x} {} init ({length} byte payload)",
+        ctaphid_command_name(command)
+    );
+    if command == CTAPHID_CBOR && length > 0 {
+        let first = report[7];
+        if is_request {
+            description.push_str(&format!(", {} (0x{first:02x})", ctap_command_name(first)));
+        } else {
+            description.push_str(&format!(
+                ", status 0x{first:02x} ({})",
+                ctap_status_name(first)
+            ));
+        }
+    } else if command == CTAPHID_INIT {
+        // An INIT payload never spans more than this first report.
+        let length = (length as usize).min(FIDO_REPORT_SIZE - 7);
+        if let Some(init) = describe_init(&report[7..7 + length], is_request) {
+            description.push_str(&format!(", {init}"));
+        }
+    }
+    description
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Trace-level payload dump. `redact` is set for every PIN protocol exchange:
+/// those payloads only ever carry ciphertext, but nothing on a PIN code path is
+/// written to the log. The PIN itself never leaves pinentry and
+/// `obtain_physical_pin_token`, and no logging path can reach it.
+#[cfg(any(target_os = "linux", windows))]
+fn trace_payload(label: &str, payload: &[u8], redact: bool) {
+    if !log_enabled!(log::Level::Trace) {
+        return;
+    }
+    if redact {
+        trace!("{label}: {} byte(s) withheld (PIN protocol)", payload.len());
+    } else {
+        trace!("{label}: {}", hex(payload));
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn cbor_integer_keys(map: &BTreeMap<Value, Value>) -> Vec<i128> {
+    map.keys()
+        .filter_map(|key| match key {
+            Value::Integer(key) => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
 fn decode_map(bytes: &[u8]) -> Result<BTreeMap<Value, Value>> {
     match serde_cbor::from_slice(bytes)? {
         Value::Map(map) => Ok(map),
@@ -1098,11 +1441,53 @@ fn get_assertion_tests_presence(map: &BTreeMap<Value, Value>) -> Result<bool> {
     }
 }
 
-fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
+/// The GetInfo fields a platform bases its decision on. None of them is a
+/// secret: they describe what the authenticator can do, not what it holds.
+fn describe_get_info(info: &BTreeMap<Value, Value>) -> String {
+    format!(
+        "versions {:?}, extensions {:?}, options {:?}, maxMsgSize {:?}, pinUvAuthProtocols {:?}, transports {:?}, algorithms {:?}",
+        info.get(&Value::Integer(1)),
+        info.get(&Value::Integer(2)),
+        info.get(&Value::Integer(4)),
+        info.get(&Value::Integer(5)),
+        info.get(&Value::Integer(6)),
+        info.get(&Value::Integer(9)),
+        info.get(&Value::Integer(10)),
+    )
+}
+
+/// Keep only ES256 among the advertised credential algorithms, leaving the
+/// list untouched if ES256 is not among them -- an empty algorithm list would
+/// be worse than an unparsed one.
+fn restrict_to_es256(info: &mut BTreeMap<Value, Value>) {
+    let Some(Value::Array(algorithms)) = info.get_mut(&Value::Integer(10)) else {
+        return;
+    };
+    let is_es256 = |entry: &Value| match entry {
+        Value::Map(entry) => entry.get(&Value::Text("alg".to_owned())) == Some(&Value::Integer(-7)),
+        _ => false,
+    };
+    if !algorithms.iter().any(is_es256) {
+        debug!("The authenticator does not advertise ES256; leaving the algorithms untouched");
+        return;
+    }
+    let before = algorithms.len();
+    algorithms.retain(is_es256);
+    debug!(
+        "Advertised algorithms restricted to ES256: {before} entries down to {}",
+        algorithms.len()
+    );
+}
+
+fn advertise_local_pin_broker(payload: &mut Vec<u8>, es256_only: bool) -> Result<()> {
     if payload.first() != Some(&CTAP2_OK) {
         return Ok(());
     }
     let mut info = decode_map(&payload[1..])?;
+    debug!(
+        "GetInfo from the authenticator: {}",
+        describe_get_info(&info)
+    );
     let versions = info
         .entry(Value::Integer(1))
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -1129,6 +1514,20 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
     options.remove(&Value::Text("clientPin".to_owned()));
     options.insert(Value::Text("pinUvAuthToken".to_owned()), Value::Bool(true));
     info.insert(Value::Integer(6), Value::Array(vec![Value::Integer(1)]));
+    // forcePINChange and minPINLength describe the Client PIN feature. Leaving
+    // them in place while `clientPin` is hidden makes the answer contradict
+    // itself: the authenticator would be stating a PIN policy for a PIN it
+    // claims not to support. Platforms that validate GetInfo for internal
+    // consistency drop such an authenticator without sending anything else.
+    info.remove(&Value::Integer(12));
+    info.remove(&Value::Integer(13));
+    if es256_only {
+        restrict_to_es256(&mut info);
+    }
+    debug!(
+        "GetInfo forwarded to the remote session: {}",
+        describe_get_info(&info)
+    );
     payload.truncate(1);
     payload.extend(serde_cbor::to_vec(&Value::Map(info))?);
     Ok(())
@@ -1137,6 +1536,7 @@ fn advertise_local_pin_broker(payload: &mut Vec<u8>) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn prompt_for_pin() -> Result<Zeroizing<String>> {
     for program in ["/usr/bin/pinentry-gnome3", "/usr/bin/pinentry"] {
+        debug!("Trying the local PIN prompt with {program}");
         let mut child = match Command::new(program)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1160,6 +1560,20 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
             .context("Cannot open pinentry output")?
             .read_to_string(&mut stdout)?;
         let status = child.wait().context("Cannot wait for pinentry")?;
+        // `stdout` carries the PIN on its `D ` line: only the exit status, the
+        // Assuan status lines and the presence of that line are ever logged,
+        // never the buffer itself.
+        debug!("{program} exited with {status}");
+        for line in stdout.lines() {
+            if let Some(assuan) = line
+                .strip_prefix("ERR ")
+                .or_else(|| line.strip_prefix("S ERROR "))
+            {
+                // pinentry reports a missing terminal or display here, and then
+                // still exits successfully, so this is the only trace of it.
+                debug!("{program} reported an Assuan error: {assuan}");
+            }
+        }
         if !status.success() {
             return Err(anyhow!("The local PIN prompt was cancelled"));
         }
@@ -1170,6 +1584,7 @@ fn prompt_for_pin() -> Result<Zeroizing<String>> {
             }
             return Ok(Zeroizing::new(pin));
         }
+        debug!("{program} returned no PIN line; treating it as a cancellation");
         return Err(anyhow!("The local PIN prompt was cancelled"));
     }
     Err(anyhow!("pinentry is required for secure FIDO PIN entry"))
@@ -1263,8 +1678,10 @@ impl FidoServer {
                 match self.device.read() {
                     Ok(OutputEvent::Output { data }) => {
                         if data.len() == FIDO_REPORT_SIZE {
+                            trace!("Virtual FIDO out: {}", describe_report(&data, true));
                             reports.push(data);
                         } else if data.len() == FIDO_REPORT_SIZE + 1 && data[0] == 0 {
+                            trace!("Virtual FIDO out: {}", describe_report(&data[1..], true));
                             reports.push(data[1..].to_vec());
                         } else {
                             warn!(
@@ -1274,11 +1691,13 @@ impl FidoServer {
                         }
                     }
                     Ok(OutputEvent::GetReport { id, .. }) => {
+                        debug!("Rejecting a virtual FIDO GET_REPORT (id {id})");
                         self.device
                             .write_get_report_reply(id, libc::EIO as u16, Vec::new())
                             .context("Cannot reject virtual FIDO GET_REPORT")?;
                     }
                     Ok(OutputEvent::SetReport { id, .. }) => {
+                        debug!("Rejecting a virtual FIDO SET_REPORT (id {id})");
                         self.device
                             .write_set_report_reply(id, libc::EIO as u16)
                             .context("Cannot reject virtual FIDO SET_REPORT")?;
@@ -1298,7 +1717,7 @@ impl FidoServer {
             }
             if !reports.is_empty() {
                 debug!(
-                    "FIDO server queued {} HID report(s) from the virtual authenticator",
+                    "Virtual FIDO device emitted {} report(s) for the client",
                     reports.len()
                 );
             }
@@ -1315,18 +1734,279 @@ impl FidoServer {
         }
         if !reports.is_empty() {
             debug!(
-                "FIDO server received {} HID report(s) for the virtual authenticator",
+                "Injecting {} FIDO report(s) from the client into the virtual device",
                 reports.len()
             );
         }
         for report in reports {
             validate_report(&report)?;
             #[cfg(target_os = "linux")]
-            self.device
-                .write(&report)
-                .context("Cannot write virtual FIDO input report")?;
+            {
+                trace!("Virtual FIDO in: {}", describe_report(&report, false));
+                self.device
+                    .write(&report)
+                    .context("Cannot write virtual FIDO input report")?;
+            }
         }
         Ok(())
+    }
+}
+
+/// How often a device thread looks for new reports when the device is there.
+///
+/// CTAPHID clients time out on the scale of a local USB transaction. Polling
+/// the device from the session loop tied every exchange to a video frame,
+/// which is long enough for a platform to abandon the channel it just opened
+/// and restart its enumeration, allocating a new channel on the authenticator
+/// each time.
+const FIDO_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// How often the device thread wakes up while it has no authenticator: there
+/// is nothing to read, and reports arriving for a missing device are dropped
+/// anyway.
+const FIDO_IDLE_INTERVAL: Duration = Duration::from_millis(50);
+/// How long to wait before looking again for an authenticator that went away.
+const FIDO_REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+pub fn same_fido_device(left: &tunnel::FidoDevice, right: &tunnel::FidoDevice) -> bool {
+    left.vendor_id == right.vendor_id
+        && left.product_id == right.product_id
+        && left.product_name == right.product_name
+}
+
+/// What the device thread needs to reopen the authenticator it lost.
+pub struct FidoReopen {
+    selector: Option<String>,
+    passthrough: bool,
+    es256_only: bool,
+    expected: tunnel::FidoDevice,
+}
+
+impl FidoReopen {
+    pub fn new(
+        selector: Option<String>,
+        passthrough: bool,
+        es256_only: bool,
+        expected: tunnel::FidoDevice,
+    ) -> Self {
+        Self {
+            selector,
+            passthrough,
+            es256_only,
+            expected,
+        }
+    }
+
+    fn try_open(&self) -> Option<FidoClient> {
+        match FidoClient::open(self.selector.as_deref(), self.passthrough, self.es256_only) {
+            Ok(candidate) if same_fido_device(&candidate.info(), &self.expected) => {
+                info!("Local FIDO authenticator reconnected; forwarding resumed");
+                Some(candidate)
+            }
+            Ok(candidate) => {
+                let candidate_info = candidate.info();
+                warn!(
+                    "Ignoring a different FIDO authenticator {:?} ({:04x}:{:04x}) while waiting for the original device",
+                    candidate_info.product_name,
+                    candidate_info.vendor_id,
+                    candidate_info.product_id
+                );
+                None
+            }
+            Err(err) => {
+                debug!("Local FIDO authenticator is still unavailable: {err:#}");
+                None
+            }
+        }
+    }
+}
+
+/// Session-side handle on a FIDO device thread.
+///
+/// The session loop never touches the device: it drains the reports the thread
+/// has already read and hands over the ones that arrived from the wire. Both
+/// directions keep the per-packet report limit of the tunnel protocol, so a
+/// burst that outruns the frame rate stays queued instead of being dropped or
+/// sent in an oversized packet.
+pub struct FidoLink {
+    requests: Sender<Vec<Vec<u8>>>,
+    answers: Receiver<Vec<u8>>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+impl FidoLink {
+    fn spawn<F>(name: &str, run: F) -> Result<Self>
+    where
+        F: FnOnce(&Receiver<Vec<Vec<u8>>>, &Sender<Vec<u8>>) -> Option<String> + Send + 'static,
+    {
+        let (request_sender, request_receiver) = mpsc::channel::<Vec<Vec<u8>>>();
+        let (answer_sender, answer_receiver) = mpsc::channel::<Vec<u8>>();
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
+        thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let reason = run(&request_receiver, &answer_sender);
+                if let Ok(mut slot) = thread_failure.lock() {
+                    *slot = reason;
+                }
+            })
+            .with_context(|| format!("Cannot start the {name} thread"))?;
+        Ok(Self {
+            requests: request_sender,
+            answers: answer_receiver,
+            failure,
+        })
+    }
+
+    /// Reports the device produced since the last call, capped to what one
+    /// tunnel packet accepts. The rest stays queued for the next call.
+    pub fn poll_reports(&mut self) -> Result<Vec<Vec<u8>>> {
+        let mut reports = Vec::new();
+        while reports.len() < MAX_REPORTS_PER_CYCLE {
+            match self.answers.try_recv() {
+                Ok(report) => reports.push(report),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if reports.is_empty() {
+                        return Err(self.stopped());
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(reports)
+    }
+
+    pub fn write_reports(&mut self, reports: Vec<Vec<u8>>) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        if reports.len() > MAX_REPORTS_PER_CYCLE {
+            return Err(anyhow!("Too many FIDO HID reports in one packet"));
+        }
+        self.requests.send(reports).map_err(|_| self.stopped())
+    }
+
+    fn stopped(&self) -> anyhow::Error {
+        match self.failure.lock().ok().and_then(|slot| slot.clone()) {
+            Some(reason) => anyhow!("The FIDO device thread stopped: {reason}"),
+            None => anyhow!("The FIDO device thread stopped"),
+        }
+    }
+}
+
+impl FidoClient {
+    /// Move the authenticator to its own thread and keep only the channels.
+    ///
+    /// The thread also owns the reconnection policy and the local PIN prompt,
+    /// which spawns pinentry and waits for the user: neither belongs on the
+    /// loop that has to keep decoding video.
+    pub fn into_link(self, reopen: FidoReopen) -> Result<FidoLink> {
+        FidoLink::spawn("fido-authenticator", move |requests, answers| {
+            run_authenticator(self, reopen, requests, answers)
+        })
+    }
+}
+
+fn run_authenticator(
+    client: FidoClient,
+    reopen: FidoReopen,
+    requests: &Receiver<Vec<Vec<u8>>>,
+    answers: &Sender<Vec<u8>>,
+) -> Option<String> {
+    let mut device = Some(client);
+    let mut retry_at: Option<Instant> = None;
+    loop {
+        let wait = match device {
+            Some(_) => FIDO_POLL_INTERVAL,
+            None => FIDO_IDLE_INTERVAL,
+        };
+        match requests.recv_timeout(wait) {
+            Ok(reports) => match device.as_mut() {
+                Some(current) => {
+                    if let Err(err) = current.write_reports(reports) {
+                        warn!(
+                            "Local FIDO authenticator disconnected while writing ({err:#}); suspending FIDO forwarding without closing the video session"
+                        );
+                        device = None;
+                        retry_at = Some(Instant::now() + FIDO_REOPEN_INTERVAL);
+                    }
+                }
+                None => debug!(
+                    "Dropping {} remote FIDO report(s) while the local authenticator is unavailable",
+                    reports.len()
+                ),
+            },
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        match device.as_mut() {
+            Some(current) => match current.poll_reports() {
+                Ok(reports) => {
+                    for report in reports {
+                        if answers.send(report).is_err() {
+                            return None;
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "Local FIDO authenticator disconnected while reading ({err:#}); suspending FIDO forwarding without closing the video session"
+                    );
+                    device = None;
+                    retry_at = Some(Instant::now() + FIDO_REOPEN_INTERVAL);
+                }
+            },
+            None => {
+                let now = Instant::now();
+                if retry_at.map_or(true, |at| at <= now) {
+                    device = reopen.try_open();
+                    retry_at = match device {
+                        Some(_) => None,
+                        None => Some(now + FIDO_REOPEN_INTERVAL),
+                    };
+                }
+            }
+        }
+    }
+}
+
+impl FidoServer {
+    /// Move the virtual authenticator to its own thread. A /dev/uhid error is
+    /// fatal for the session, so it is reported through the channel closing
+    /// instead of being retried.
+    pub fn into_link(self) -> Result<FidoLink> {
+        FidoLink::spawn("fido-virtual", move |requests, answers| {
+            run_virtual_device(self, requests, answers)
+        })
+    }
+}
+
+fn run_virtual_device(
+    mut device: FidoServer,
+    requests: &Receiver<Vec<Vec<u8>>>,
+    answers: &Sender<Vec<u8>>,
+) -> Option<String> {
+    loop {
+        match requests.recv_timeout(FIDO_POLL_INTERVAL) {
+            Ok(reports) => {
+                if let Err(err) = device.write_reports(reports) {
+                    return Some(format!("{err:#}"));
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+        match device.poll_reports() {
+            Ok(reports) => {
+                for report in reports {
+                    if answers.send(report).is_err() {
+                        return None;
+                    }
+                }
+            }
+            Err(err) => return Some(format!("{err:#}")),
+        }
     }
 }
 
@@ -1361,6 +2041,20 @@ fn validate_report(report: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fido_reconnect_requires_the_same_device_identity() {
+        let yubikey = tunnel::FidoDevice {
+            vendor_id: 0x1050,
+            product_id: 0x0407,
+            product_name: "YubiKey OTP+FIDO+CCID".to_owned(),
+        };
+        assert!(same_fido_device(&yubikey, &yubikey));
+
+        let mut other = yubikey.clone();
+        other.product_id = 0x0406;
+        assert!(!same_fido_device(&yubikey, &other));
+    }
 
     #[test]
     fn accepts_only_complete_ctaphid_reports() {
@@ -1462,9 +2156,11 @@ mod tests {
         let mut payload = ctap_success(map_of([
             (1, Value::Array(vec![Value::Text("FIDO_2_0".to_owned())])),
             (4, Value::Map(options)),
+            (12, Value::Bool(false)),
+            (13, Value::Integer(4)),
         ]))
         .unwrap();
-        advertise_local_pin_broker(&mut payload).unwrap();
+        advertise_local_pin_broker(&mut payload, false).unwrap();
         let info = successful_map(&payload, "test").unwrap();
         let Value::Array(versions) = map_value(&info, 1).unwrap() else {
             panic!("versions should be an array");
@@ -1483,6 +2179,40 @@ mod tests {
             options.get(&Value::Text("pinUvAuthToken".to_owned())),
             Some(&Value::Bool(true))
         );
+        // The Client PIN policy must not outlive the Client PIN option.
+        assert_eq!(info.get(&Value::Integer(12)), None);
+        assert_eq!(info.get(&Value::Integer(13)), None);
+    }
+
+    #[test]
+    fn keeps_only_es256_when_asked_and_never_empties_the_list() {
+        let es256 = Value::Map(BTreeMap::from([
+            (Value::Text("alg".to_owned()), Value::Integer(-7)),
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("public-key".to_owned()),
+            ),
+        ]));
+        let eddsa = Value::Map(BTreeMap::from([
+            (Value::Text("alg".to_owned()), Value::Integer(-8)),
+            (
+                Value::Text("type".to_owned()),
+                Value::Text("public-key".to_owned()),
+            ),
+        ]));
+
+        let mut info = map_of([(10, Value::Array(vec![es256.clone(), eddsa.clone()]))]);
+        restrict_to_es256(&mut info);
+        assert_eq!(
+            map_value(&info, 10).unwrap(),
+            &Value::Array(vec![es256.clone()])
+        );
+
+        // An authenticator without ES256 keeps everything: an empty algorithm
+        // list would be worse than an unrecognized one.
+        let mut info = map_of([(10, Value::Array(vec![eddsa.clone()]))]);
+        restrict_to_es256(&mut info);
+        assert_eq!(map_value(&info, 10).unwrap(), &Value::Array(vec![eddsa]));
     }
 
     #[test]
